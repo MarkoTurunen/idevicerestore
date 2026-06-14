@@ -4130,7 +4130,7 @@ int extract_macos_variant(plist_t build_identity, char** output)
 	return 0;
 }
 
-static char* extract_global_manifest_path(plist_t build_identity, char *variant)
+static char* extract_global_manifest_path(plist_t build_identity, const char *variant)
 {
 	plist_t build_info = plist_dict_get_item(build_identity, "Info");
 	if (!build_info) {
@@ -4146,16 +4146,16 @@ static char* extract_global_manifest_path(plist_t build_identity, char *variant)
 	char *device_class = NULL;
 	plist_get_string_val(device_class_node, &device_class);
 
-	char *macos_variant = NULL;
+	const char *macos_variant = variant;
+	char *allocated_variant = NULL;
 	int ret;
-	if (variant) {
-		macos_variant = variant;
-	} else {
-		ret = extract_macos_variant(build_identity, &macos_variant);
+	if (!macos_variant) {
+		ret = extract_macos_variant(build_identity, &allocated_variant);
 		if (ret != 0) {
 			free(device_class);
 			return NULL;
 		}
+		macos_variant = allocated_variant;
 	}
 
 	// The path of the global manifest is hardcoded. There's no pointer to in the build manifest.
@@ -4164,12 +4164,12 @@ static char* extract_global_manifest_path(plist_t build_identity, char *variant)
 	snprintf(ticket_path, psize, "Firmware/Manifests/restore/%s/apticket.%s.im4m", macos_variant, device_class);
 
 	free(device_class);
-	free(macos_variant);
+	free(allocated_variant);
 
 	return ticket_path;
 }
 
-int extract_global_manifest(struct idevicerestore_client_t* client, plist_t build_identity, char *variant, void** pbuffer, size_t* psize)
+int extract_global_manifest(struct idevicerestore_client_t* client, plist_t build_identity, const char *variant, void** pbuffer, size_t* psize)
 {
 	char* ticket_path = extract_global_manifest_path(build_identity, variant);
 	if (!ticket_path) {
@@ -4365,22 +4365,22 @@ int restore_send_personalized_boot_object_v3(struct idevicerestore_client_t* cli
 	return 0;
 }
 
-int restore_send_source_boot_object_v4(struct idevicerestore_client_t* client, plist_t message)
+static int restore_send_source_boot_object(struct idevicerestore_client_t* client, plist_t message, const char *data_type)
 {
 	if (client->debug_level > 1) {
-		logger(LL_DEBUG, "%s: Got SourceBootObjectV4 request:\n", __func__);
+		logger(LL_DEBUG, "%s: Got %s request:\n", __func__, data_type);
 		logger_dump_plist(LL_DEBUG, message, 1);
 	}
 
 	char *image_name = NULL;
 	plist_t node = plist_access_path(message, 2, "Arguments", "ImageName");
 	if (!node || plist_get_node_type(node) != PLIST_STRING) {
-		logger(LL_DEBUG, "Failed to parse arguments from SourceBootObjectV4 plist\n");
+		logger(LL_DEBUG, "Failed to parse arguments from %s plist\n", data_type);
 		return -1;
 	}
 	plist_get_string_val(node, &image_name);
 	if (!image_name) {
-		logger(LL_DEBUG, "Failed to parse arguments from SourceBootObjectV4 as string\n");
+		logger(LL_DEBUG, "Failed to parse arguments from %s as string\n", data_type);
 		return -1;
 	}
 
@@ -4395,16 +4395,17 @@ int restore_send_source_boot_object_v4(struct idevicerestore_client_t* client, p
 		char *variant = NULL;
 		plist_t node = plist_access_path(message, 2, "Arguments", "Variant");
 		if (!node || plist_get_node_type(node) != PLIST_STRING) {
-			logger(LL_DEBUG, "Failed to parse arguments from SourceBootObjectV4 plist\n");
+			logger(LL_DEBUG, "Failed to parse arguments from %s plist\n", data_type);
 			return -1;
 		}
 		plist_get_string_val(node, &variant);
 		if (!variant) {
-			logger(LL_DEBUG, "Failed to parse arguments from SourceBootObjectV4 as string\n");
+			logger(LL_DEBUG, "Failed to parse arguments from %s as string\n", data_type);
 			return -1;
 		}
 
 		path = extract_global_manifest_path(client->restore->build_identity, variant);
+		free(variant);
 	} else if (strcmp(image_name, "__RestoreVersion__") == 0) {
 		path = strdup("RestoreVersion.plist");
 	} else if (strcmp(image_name, "__SystemVersion__") == 0) {
@@ -4418,6 +4419,10 @@ int restore_send_source_boot_object_v4(struct idevicerestore_client_t* client, p
 		}
 		if (!path) {
 			plist_t build_identity = restore_get_build_identity_from_request(client, message);
+			if (!build_identity) {
+				logger(LL_ERROR, "Unable to find a matching build identity\n");
+				return -1;
+			}
 			if (build_identity_get_component_path(build_identity, component, &path) < 0) {
 				logger(LL_ERROR, "Unable to find %s path from build identity\n", component);
 				return -1;
@@ -4463,6 +4468,16 @@ int restore_send_source_boot_object_v4(struct idevicerestore_client_t* client, p
 
 	logger(LL_INFO, "Done sending %s\n", component);
 	return 0;
+}
+
+int restore_send_source_boot_object_v4(struct idevicerestore_client_t* client, plist_t message)
+{
+	return restore_send_source_boot_object(client, message, "SourceBootObjectV4");
+}
+
+int restore_send_source_boot_object_v5(struct idevicerestore_client_t* client, plist_t message)
+{
+	return restore_send_source_boot_object(client, message, "SourceBootObjectV5");
 }
 
 int restore_send_restore_local_policy(struct idevicerestore_client_t* client, plist_t message)
@@ -4823,6 +4838,13 @@ logger(LL_DEBUG, "%s: type = %s\n", __func__, type);
 		else if (!strcmp(type, "SourceBootObjectV4")) {
 			if (restore_send_source_boot_object_v4(client, message) < 0) {
 				logger(LL_ERROR, "Unable to send SourceBootObjectV4\n");
+				return -1;
+			}
+		}
+
+		else if (!strcmp(type, "SourceBootObjectV5")) {
+			if (restore_send_source_boot_object_v5(client, message) < 0) {
+				logger(LL_ERROR, "Unable to send SourceBootObjectV5\n");
 				return -1;
 			}
 		}
@@ -5201,6 +5223,7 @@ plist_t restore_supported_data_types()
 	plist_dict_set_item(dict, "S3EOverride", plist_new_bool(0));
 	plist_dict_set_item(dict, "SourceBootObjectV3", plist_new_bool(0));
 	plist_dict_set_item(dict, "SourceBootObjectV4", plist_new_bool(0));
+	plist_dict_set_item(dict, "SourceBootObjectV5", plist_new_bool(0));
 	plist_dict_set_item(dict, "SsoServiceTicket", plist_new_bool(0));
 	plist_dict_set_item(dict, "StockholmPostflight", plist_new_bool(0));
 	plist_dict_set_item(dict, "SystemImageCanonicalMetadata", plist_new_bool(0));
