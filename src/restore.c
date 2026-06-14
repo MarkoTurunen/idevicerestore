@@ -4187,6 +4187,28 @@ int extract_global_manifest(struct idevicerestore_client_t* client, plist_t buil
 	return 0;
 }
 
+static char* restore_resolve_global_manifest_path(struct idevicerestore_client_t* client, plist_t build_identity, const char *variant)
+{
+	char *path = NULL;
+
+	if (variant) {
+		path = extract_global_manifest_path(build_identity, variant);
+		if (path && ipsw_file_exists(client->ipsw, path)) {
+			return path;
+		}
+		logger(LL_DEBUG, "Global manifest path for variant '%s' not found, trying build identity MacOSVariant\n", variant);
+		free(path);
+	}
+
+	path = extract_global_manifest_path(build_identity, NULL);
+	if (path && ipsw_file_exists(client->ipsw, path)) {
+		return path;
+	}
+	free(path);
+
+	return NULL;
+}
+
 struct _restore_send_file_data_ctx {
 	struct idevicerestore_client_t* client;
 	restore_service_client_t service;
@@ -4392,6 +4414,10 @@ static int restore_send_source_boot_object(struct idevicerestore_client_t* clien
 	logger(LL_INFO, "About to send %s...\n", component);
 
 	if (strcmp(image_name, "__GlobalManifest__") == 0) {
+		plist_t build_identity = restore_get_build_identity_from_request(client, message);
+		if (!build_identity) {
+			build_identity = client->restore->build_identity;
+		}
 		char *variant = NULL;
 		plist_t node = plist_access_path(message, 2, "Arguments", "Variant");
 		if (!node || plist_get_node_type(node) != PLIST_STRING) {
@@ -4404,7 +4430,7 @@ static int restore_send_source_boot_object(struct idevicerestore_client_t* clien
 			return -1;
 		}
 
-		path = extract_global_manifest_path(client->restore->build_identity, variant);
+		path = restore_resolve_global_manifest_path(client, build_identity, variant);
 		free(variant);
 	} else if (strcmp(image_name, "__RestoreVersion__") == 0) {
 		path = strdup("RestoreVersion.plist");
@@ -4436,7 +4462,11 @@ static int restore_send_source_boot_object(struct idevicerestore_client_t* clien
 	}
 
 	uint64_t fsize = 0;
-	ipsw_get_file_size(client->ipsw, path, &fsize);
+	if (ipsw_get_file_size(client->ipsw, path, &fsize) < 0) {
+		logger(LL_ERROR, "Unable to get size for component %s path %s\n", component, path);
+		free(path);
+		return -1;
+	}
 
 	restore_service_client_t service = _restore_get_service_client_for_data_request(client, message);
 	if (!service) {
