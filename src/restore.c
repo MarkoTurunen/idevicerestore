@@ -4134,7 +4134,7 @@ int extract_macos_variant(plist_t build_identity, char** output)
 	return 0;
 }
 
-static char* extract_global_manifest_path(plist_t build_identity, char *variant)
+static char* extract_global_manifest_path(ipsw_archive_t ipsw, plist_t build_identity, char *variant)
 {
 	plist_t build_info = plist_dict_get_item(build_identity, "Info");
 	if (!build_info) {
@@ -4153,7 +4153,11 @@ static char* extract_global_manifest_path(plist_t build_identity, char *variant)
 	char *macos_variant = NULL;
 	int ret;
 	if (variant) {
-		macos_variant = variant;
+		macos_variant = strdup(variant);
+		if (!macos_variant) {
+			free(device_class);
+			return NULL;
+		}
 	} else {
 		ret = extract_macos_variant(build_identity, &macos_variant);
 		if (ret != 0) {
@@ -4163,9 +4167,41 @@ static char* extract_global_manifest_path(plist_t build_identity, char *variant)
 	}
 
 	// The path of the global manifest is hardcoded. There's no pointer to in the build manifest.
-	size_t psize = 42+strlen(macos_variant)+strlen(device_class)+1;
+	// Older IPSWs use the legacy apticket layout, while newer ones place the file under a
+	// subdirectory with a centauri-prefixed filename.
+	const char *candidate_paths[] = {
+		"Firmware/Manifests/restore/%s/apticket.%s.im4m",
+		"Firmware/Manifests/restore/%s/centauri/centauri.%s.im4m"
+	};
+	const size_t num_candidates = sizeof(candidate_paths) / sizeof(candidate_paths[0]);
+
+	for (size_t i = 0; i < num_candidates; i++) {
+		size_t psize = snprintf(NULL, 0, candidate_paths[i], macos_variant, device_class) + 1;
+		char *ticket_path = malloc(psize);
+		if (!ticket_path) {
+			free(device_class);
+			free(macos_variant);
+			return NULL;
+		}
+		snprintf(ticket_path, psize, candidate_paths[i], macos_variant, device_class);
+
+		if (!ipsw || ipsw_file_exists(ipsw, ticket_path)) {
+			free(device_class);
+			free(macos_variant);
+			return ticket_path;
+		}
+		free(ticket_path);
+	}
+
+	// Fallback to the legacy path when no candidate is present in the IPSW.
+	size_t psize = snprintf(NULL, 0, candidate_paths[0], macos_variant, device_class) + 1;
 	char *ticket_path = malloc(psize);
-	snprintf(ticket_path, psize, "Firmware/Manifests/restore/%s/apticket.%s.im4m", macos_variant, device_class);
+	if (!ticket_path) {
+		free(device_class);
+		free(macos_variant);
+		return NULL;
+	}
+	snprintf(ticket_path, psize, candidate_paths[0], macos_variant, device_class);
 
 	free(device_class);
 	free(macos_variant);
@@ -4175,7 +4211,7 @@ static char* extract_global_manifest_path(plist_t build_identity, char *variant)
 
 int extract_global_manifest(struct idevicerestore_client_t* client, plist_t build_identity, char *variant, void** pbuffer, size_t* psize)
 {
-	char* ticket_path = extract_global_manifest_path(build_identity, variant);
+	char* ticket_path = extract_global_manifest_path(client->ipsw, build_identity, variant);
 	if (!ticket_path) {
 		logger(LL_ERROR, "failed to get global manifest path\n");
 		return -1;
@@ -4408,7 +4444,7 @@ int restore_send_source_boot_object_v4(struct idevicerestore_client_t* client, p
 			return -1;
 		}
 
-		path = extract_global_manifest_path(client->restore->build_identity, variant);
+		path = extract_global_manifest_path(client->ipsw, client->restore->build_identity, variant);
 	} else if (strcmp(image_name, "__RestoreVersion__") == 0) {
 		path = strdup("RestoreVersion.plist");
 	} else if (strcmp(image_name, "__SystemVersion__") == 0) {
