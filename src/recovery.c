@@ -28,6 +28,7 @@
 #include <libirecovery.h>
 #include <libimobiledevice/restore.h>
 #include <libimobiledevice/libimobiledevice.h>
+#include <inttypes.h>
 
 #include <libtatsu/tss.h>
 
@@ -348,28 +349,28 @@ int recovery_send_component_and_command(struct idevicerestore_client_t* client, 
 
 int recovery_send_ibec(struct idevicerestore_client_t* client, plist_t build_identity)
 {
-	const char* component = "iBEC";
-	irecv_error_t recovery_error = IRECV_E_SUCCESS;
+    const char* component = "iBEC";
+    irecv_error_t recovery_error = IRECV_E_SUCCESS;
 
-	if (client->recovery == NULL) {
-		if (recovery_client_new(client) < 0) {
-			return -1;
-		}
-	}
+    if (client->recovery == NULL) {
+        if (recovery_client_new(client) < 0) {
+            return -1;
+        }
+    }
 
-	if (recovery_send_component(client, build_identity, component) < 0) {
-		logger(LL_ERROR, "Unable to send %s to device.\n", component);
-		return -1;
-	}
+    if (recovery_send_component(client, build_identity, component) < 0) {
+        logger(LL_ERROR, "Unable to send %s to device.\n", component);
+        return -1;
+    }
 
-	recovery_error = irecv_send_command_breq(client->recovery->client, "go", 1);
-	if (recovery_error != IRECV_E_SUCCESS) {
-		logger(LL_ERROR, "Unable to execute %s\n", component);
-		return -1;
-	}
-	irecv_usb_control_transfer(client->recovery->client, 0x21, 1, 0, 0, 0, 0, 5000);
+    recovery_error = irecv_send_command_breq(client->recovery->client, "go", 1);
+    if (recovery_error != IRECV_E_SUCCESS) {
+        logger(LL_ERROR, "Unable to execute %s\n", component);
+        return -1;
+    }
+    irecv_usb_control_transfer(client->recovery->client, 0x21, 1, 0, 0, 0, 0, 5000);
 
-	return 0;
+    return 0;
 }
 
 int recovery_send_applelogo(struct idevicerestore_client_t* client, plist_t build_identity)

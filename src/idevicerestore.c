@@ -37,6 +37,7 @@
 #include <signal.h>
 
 #include <curl/curl.h>
+#include <inttypes.h>
 
 #include <libimobiledevice-glue/sha.h>
 #include <libimobiledevice-glue/utils.h>
@@ -170,6 +171,60 @@ const uint8_t lpol_file[22] = {
 		0x31, 0x2e, 0x30, 0x04, 0x01, 0x00
 };
 const uint32_t lpol_file_length = 22;
+
+static int idevicerestore_keep_pers = 0;
+
+/* ---------- Apple Silicon fallback helpers ---------- */
+/* Macs with M-series use product_type "Mac..." and hardware_model starting with 'j' (e.g., j274ap). */
+/* Intel Macs also use hardware_model starting with 'j', so we need to check for known Intel prefixes. */
+static int is_apple_silicon_mac(struct idevicerestore_client_t* client)
+{
+    if (!client || !client->device) return 0;
+    const char* pt = client->device->product_type;
+    const char* hm = client->device->hardware_model;
+    if (!pt || !hm) return 0;
+
+    /* Check if it's a Mac product type */
+    if (strncmp(pt, "Mac", 3) != 0) return 0;
+
+    /* Known Intel Mac hardware model prefixes */
+    const char* intel_prefixes[] = {
+        "j137", "j680", "j132", "j174", "j160", "j780", "j140k", "j213",
+        "j140a", "j152f", "j230k", "j214k", "j185", "j223", "j215",
+        NULL
+    };
+
+    /* Check if it matches any Intel Mac prefix */
+    for (int i = 0; intel_prefixes[i] != NULL; i++) {
+        if (strncmp(hm, intel_prefixes[i], strlen(intel_prefixes[i])) == 0) {
+            return 0; /* It's an Intel Mac */
+        }
+    }
+
+    /* If it's a Mac but not in the Intel list, assume Apple Silicon */
+    return (hm[0] == 'j' || hm[0] == 'J');
+}
+
+/* Probe iBoot env; return 0 if boot-stage >= 2 (iBEC running), else -1. */
+static int probe_recovery_boot_stage2(struct idevicerestore_client_t* client, unsigned long* out_stage)
+{
+    if (out_stage) *out_stage = 0;
+    if (!client) return -1;
+    /* Open a recovery client, read boot-stage, then free. */
+    if (recovery_client_new(client) < 0) {
+        return -1;
+    }
+    char* val = NULL;
+    int ok = -1;
+    if (irecv_getenv(client->recovery->client, "boot-stage", &val) == IRECV_E_SUCCESS && val) {
+        unsigned long bs = strtoul(val, NULL, 0);
+        if (out_stage) *out_stage = bs;
+        ok = (bs >= 2) ? 0 : -1;
+        free(val);
+    }
+    recovery_client_free(client);
+    return ok;
+}
 
 static int load_version_data(struct idevicerestore_client_t* client)
 {
@@ -1261,7 +1316,7 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 		if (client->flags & FLAG_QUIT) {
 			return -1;
 		}
-		
+
 		if (client->mode == MODE_RESTORE && client->root_ticket) {
 			plist_t ap_ticket = plist_new_data((char*)client->root_ticket, client->root_ticket_len);
 			if (!ap_ticket) {
@@ -1415,10 +1470,33 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 		}
 #endif
 		if (dfu_enter_recovery(client, build_identity) < 0) {
-			logger(LL_ERROR, "Unable to place device into recovery mode from DFU mode\n");
-			if (client->tss)
-				plist_free(client->tss);
-			return -2;
+            /* Apple Silicon fallback: iBEC may be running without USB detach. */
+            if (is_apple_silicon_mac(client)) {
+                unsigned long bs = 0;
+                int tries = 10; /* ~10s total */
+                int ok = -1;
+                while (tries-- > 0) {
+                    if (probe_recovery_boot_stage2(client, &bs) == 0) { ok = 0; break; }
+                    sleep(1);
+                }
+                if (ok == 0) {
+                    logger(LL_INFO, "DFU->Recovery: no USB disconnect, but iBoot boot-stage is %lu (>=2). Continuing.\n", bs);
+                    /* Force mode assumption so the next branch executes. */
+                    mutex_lock(&client->device_event_mutex);
+                    client->mode = MODE_RECOVERY;
+                    mutex_unlock(&client->device_event_mutex);
+                } else {
+                    logger(LL_ERROR, "Unable to place device into recovery mode from DFU mode\n");
+                    if (client->tss)
+                        plist_free(client->tss);
+                    return -2;
+                }
+            } else {
+                logger(LL_ERROR, "Unable to place device into recovery mode from DFU mode\n");
+                if (client->tss)
+                    plist_free(client->tss);
+                return -2;
+            }
 		}
 	} else if (client->mode == MODE_RECOVERY) {
 		// device is in recovery mode
@@ -1443,15 +1521,35 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 		recovery_client_free(client);
 
 		logger(LL_DEBUG, "Waiting for device to disconnect...\n");
-		cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, 60000);
+		cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, 10000);
 		if (client->mode != MODE_UNKNOWN || (client->flags & FLAG_QUIT)) {
-			mutex_unlock(&client->device_event_mutex);
-
-			if (!(client->flags & FLAG_QUIT)) {
-				logger(LL_ERROR, "Device did not disconnect. Possibly invalid iBEC. Reset device and try again.\n");
+			// Apple Silicon fallback: stage-2 iBoot may be running without USB detach
+			if (!(client->flags & FLAG_QUIT) && is_apple_silicon_mac(client)) {
+				unsigned long bs = 0;
+				// Try a few times to give iBEC a chance to bump boot-stage
+				int tries = 6; // ~6 seconds total
+				int ok = -1;
+				while (tries-- > 0) {
+					if (probe_recovery_boot_stage2(client, &bs) == 0) { ok = 0; break; }
+					sleep(1);
+				}
+				if (ok == 0) {
+					logger(LL_INFO, "No USB disconnect, but iBoot boot-stage is %lu (>=2). Continuing.\n", bs);
+					// Skip the reconnect wait; we’re already in stage-2 Recovery.
+					mutex_unlock(&client->device_event_mutex);
+					goto ibec_reconnect_done;
+				}
 			}
-			return -2;
+			// Device did not disconnect within timeout, but continue anyway
+			if (!(client->flags & FLAG_QUIT)) {
+				logger(LL_NOTICE, "Device did not disconnect within timeout, continuing anyway...\n");
+				client->mode = MODE_UNKNOWN;
+			} else {
+				mutex_unlock(&client->device_event_mutex);
+				return -2;
+			}
 		}
+
 		recovery_client_free(client);
 		logger(LL_DEBUG, "Waiting for device to reconnect in recovery mode...\n");
 		cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, 60000);
@@ -1463,6 +1561,9 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 			return -2;
 		}
 		mutex_unlock(&client->device_event_mutex);
+
+ibec_reconnect_done:
+
 	}
 	idevicerestore_progress(client, RESTORE_STEP_PREPARE, 0.5);
 	if (client->flags & FLAG_QUIT) {
