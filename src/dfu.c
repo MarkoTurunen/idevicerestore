@@ -41,6 +41,39 @@ static int dfu_progress_callback(irecv_client_t client, const irecv_event_t* eve
 	return 0;
 }
 
+
+/*
+ * Apple Silicon Macs can re-enumerate from DFU as recovery without the
+ * libirecovery device event subscriber observing the intermediate remove
+ * event. Confirm the mode directly before treating a missed event as a
+ * failed iBSS transition.
+ */
+static int dfu_probe_recovery_mode(struct idevicerestore_client_t* client)
+{
+	irecv_client_t probe = NULL;
+	int mode = 0;
+	int is_recovery = 0;
+
+	if (!client || irecv_open_with_ecid_and_attempts(&probe, client->ecid, 3) != IRECV_E_SUCCESS) {
+		return 0;
+	}
+
+	irecv_get_mode(probe, &mode);
+	switch (mode) {
+		case IRECV_K_RECOVERY_MODE_1:
+		case IRECV_K_RECOVERY_MODE_2:
+		case IRECV_K_RECOVERY_MODE_3:
+		case IRECV_K_RECOVERY_MODE_4:
+			is_recovery = 1;
+			break;
+		default:
+			break;
+	}
+
+	irecv_close(probe);
+	return is_recovery;
+}
+
 int dfu_client_new(struct idevicerestore_client_t* client)
 {
 	irecv_client_t dfu = NULL;
@@ -474,6 +507,13 @@ int dfu_enter_recovery(struct idevicerestore_client_t* client, plist_t build_ide
 		cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, 10000);
 		if (client->mode != MODE_UNKNOWN || (client->flags & FLAG_QUIT)) {
 			mutex_unlock(&client->device_event_mutex);
+			if (!(client->flags & FLAG_QUIT) && client->macos_variant && dfu_probe_recovery_mode(client)) {
+				logger(LL_NOTICE, "DFU->Recovery: missed USB disconnect event, but the Mac is reachable in recovery mode. Continuing.\n");
+				mutex_lock(&client->device_event_mutex);
+				client->mode = MODE_RECOVERY;
+				mutex_unlock(&client->device_event_mutex);
+				goto ibss_reconnect_done;
+			}
 			if (!(client->flags & FLAG_QUIT)) {
 				logger(LL_ERROR, "Device did not disconnect. Possibly invalid iBSS. Reset device and try again.\n");
 			}
@@ -489,6 +529,8 @@ int dfu_enter_recovery(struct idevicerestore_client_t* client, plist_t build_ide
 			return -1;
 		}
 		mutex_unlock(&client->device_event_mutex);
+
+ibss_reconnect_done:
 		dfu_client_new(client);
 
 		/* get nonce */

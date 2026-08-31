@@ -1470,33 +1470,11 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 		}
 #endif
 		if (dfu_enter_recovery(client, build_identity) < 0) {
-            /* Apple Silicon fallback: iBEC may be running without USB detach. */
-            if (is_apple_silicon_mac(client)) {
-                unsigned long bs = 0;
-                int tries = 10; /* ~10s total */
-                int ok = -1;
-                while (tries-- > 0) {
-                    if (probe_recovery_boot_stage2(client, &bs) == 0) { ok = 0; break; }
-                    sleep(1);
-                }
-                if (ok == 0) {
-                    logger(LL_INFO, "DFU->Recovery: no USB disconnect, but iBoot boot-stage is %lu (>=2). Continuing.\n", bs);
-                    /* Force mode assumption so the next branch executes. */
-                    mutex_lock(&client->device_event_mutex);
-                    client->mode = MODE_RECOVERY;
-                    mutex_unlock(&client->device_event_mutex);
-                } else {
-                    logger(LL_ERROR, "Unable to place device into recovery mode from DFU mode\n");
-                    if (client->tss)
-                        plist_free(client->tss);
-                    return -2;
-                }
-            } else {
-                logger(LL_ERROR, "Unable to place device into recovery mode from DFU mode\n");
-                if (client->tss)
-                    plist_free(client->tss);
-                return -2;
-            }
+			logger(LL_ERROR, "Unable to place device into recovery mode from DFU mode\n");
+			if (client->tss)
+				plist_free(client->tss);
+			return -2;
+
 		}
 	} else if (client->mode == MODE_RECOVERY) {
 		// device is in recovery mode
