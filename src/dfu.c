@@ -51,6 +51,7 @@ static int dfu_progress_callback(irecv_client_t client, const irecv_event_t* eve
 static int dfu_probe_recovery_mode(struct idevicerestore_client_t* client)
 {
 	irecv_client_t probe = NULL;
+	const struct irecv_device_info* device_info = NULL;
 	int mode = 0;
 	int is_recovery = 0;
 
@@ -59,6 +60,11 @@ static int dfu_probe_recovery_mode(struct idevicerestore_client_t* client)
 	}
 
 	irecv_get_mode(probe, &mode);
+	device_info = irecv_get_device_info(probe);
+	if (device_info && device_info->pid == 0x1881) {
+		/* DFU via Debug USB (KIS). The ECID was validated while opening. */
+		is_recovery = 1;
+	}
 	switch (mode) {
 		case IRECV_K_RECOVERY_MODE_1:
 		case IRECV_K_RECOVERY_MODE_2:
