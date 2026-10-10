@@ -448,13 +448,16 @@ int dfu_send_iboot_stage1_components(struct idevicerestore_client_t* client, pli
 static int dfu_poke_device(struct idevicerestore_client_t* client)
 {
 	irecv_client_t dev = NULL;
+	irecv_error_t err;
 	int mode = 0;
 	int stage2 = 0;
 
-	logger(LL_DEBUG, "Device did not detach yet, re-opening it...\n");
+	logger(LL_INFO, "Device did not detach yet, re-opening it to wake it up (ECID 0x%" PRIx64 ")...\n", client->ecid);
 	/* A single attempt: the device usually re-enumerates while being opened,
 	 * and a failed open here is expected and harmless. */
-	if (irecv_open_with_ecid(&dev, client->ecid) != IRECV_E_SUCCESS) {
+	err = irecv_open_with_ecid(&dev, client->ecid);
+	if (err != IRECV_E_SUCCESS) {
+		logger(LL_INFO, "Wake-up open failed: %s (%d)\n", irecv_strerror(err), err);
 		return 0;
 	}
 	irecv_get_mode(dev, &mode);
@@ -465,6 +468,7 @@ static int dfu_poke_device(struct idevicerestore_client_t* client)
 			free(value);
 		}
 	}
+	logger(LL_INFO, "Wake-up open succeeded (mode 0x%x%s)\n", mode, stage2 ? ", boot-stage 2" : "");
 	irecv_close(dev);
 	return stage2;
 }
