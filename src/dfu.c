@@ -677,14 +677,14 @@ int dfu_enter_recovery(struct idevicerestore_client_t* client, plist_t build_ide
 	logger(LL_DEBUG, "Waiting for device to disconnect...\n");
 	cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, (client->macos_variant) ? 5000 : 10000);
 	if (client->macos_variant && client->mode == MODE_RECOVERY && !(client->flags & FLAG_QUIT)) {
-		/* iBEC may be running without a USB detach, or may need a poke to start */
+		/* iBEC may need a poke to start. It then usually detaches and
+		 * reconnects, but may also keep running without a USB detach, so let
+		 * it settle before deciding; a detach is handled by the waits below. */
 		int ibec_running = dfu_poke_device(client);
-		if (!ibec_running) {
-			cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, 30000);
-			ibec_running = (client->mode == MODE_RECOVERY && dfu_poke_device(client));
-		}
-		if (ibec_running) {
-			logger(LL_INFO, "iBEC is running (boot-stage 2), continuing.\n");
+		cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, (ibec_running) ? 10000 : 30000);
+		if (client->mode == MODE_RECOVERY && !(client->flags & FLAG_QUIT) &&
+		    (ibec_running || dfu_poke_device(client))) {
+			logger(LL_INFO, "iBEC is running (boot-stage 2) without USB reconnect, continuing.\n");
 			mutex_unlock(&client->device_event_mutex);
 			goto ibec_started;
 		}
