@@ -1759,7 +1759,8 @@ static void plain_progress_func(struct progress_info_entry** progress_info, int 
 	int i = 0;
 	for (i = 0; i < count; i++) {
 		if (!progress_info[i]) continue;
-		printf("%s: %5.1f\n", progress_info[i]->label, progress_info[i]->progress);
+		/* progress is 0..1; print it as a percentage like the progress bar does */
+		printf("%s: %5.1f\n", progress_info[i]->label, progress_info[i]->progress * 100.0);
 		fflush(stdout);
 	}
 }
