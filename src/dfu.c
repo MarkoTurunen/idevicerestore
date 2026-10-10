@@ -441,6 +441,32 @@ int dfu_send_iboot_stage1_components(struct idevicerestore_client_t* client, pli
 	return (err) ? -1 : 0;
 }
 
+/* Some Apple Silicon Macs (seen with an M5 on a Linux host) don't act on an
+ * uploaded iBoot image until the device is opened again, so they never detach
+ * by themselves. Open and close the device once to wake it up.
+ * Returns 1 if the device reports iBoot boot-stage 2 (iBEC running), else 0. */
+static int dfu_poke_device(struct idevicerestore_client_t* client)
+{
+	irecv_client_t dev = NULL;
+	int mode = 0;
+	int stage2 = 0;
+
+	logger(LL_DEBUG, "Device did not detach yet, re-opening it...\n");
+	if (irecv_open_with_ecid_and_attempts(&dev, client->ecid, 2) != IRECV_E_SUCCESS) {
+		return 0;
+	}
+	irecv_get_mode(dev, &mode);
+	if (mode != IRECV_K_DFU_MODE && mode != IRECV_K_PORT_DFU_MODE) {
+		char* value = NULL;
+		if (irecv_getenv(dev, "boot-stage", &value) == IRECV_E_SUCCESS && value) {
+			stage2 = (strtoul(value, NULL, 0) >= 2);
+			free(value);
+		}
+	}
+	irecv_close(dev);
+	return stage2;
+}
+
 int dfu_enter_recovery(struct idevicerestore_client_t* client, plist_t build_identity)
 {
 	int mode = 0;
@@ -471,16 +497,23 @@ int dfu_enter_recovery(struct idevicerestore_client_t* client, plist_t build_ide
 	if (client->build_major > 8) {
 		/* reconnect */
 		logger(LL_DEBUG, "Waiting for device to disconnect...\n");
-		cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, 10000);
-		if (client->mode != MODE_UNKNOWN || (client->flags & FLAG_QUIT)) {
+		cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, 5000);
+		if (client->mode == MODE_DFU && !(client->flags & FLAG_QUIT)) {
+			dfu_poke_device(client);
+			cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, 30000);
+		}
+		/* MODE_RECOVERY here means the disconnect and reconnect were both handled already */
+		if ((client->mode != MODE_UNKNOWN && client->mode != MODE_RECOVERY) || (client->flags & FLAG_QUIT)) {
 			mutex_unlock(&client->device_event_mutex);
 			if (!(client->flags & FLAG_QUIT)) {
 				logger(LL_ERROR, "Device did not disconnect. Possibly invalid iBSS. Reset device and try again.\n");
 			}
 			return -1;
 		}
-		logger(LL_DEBUG, "Waiting for device to reconnect...\n");
-		cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, 10000);
+		if (client->mode == MODE_UNKNOWN) {
+			logger(LL_DEBUG, "Waiting for device to reconnect...\n");
+			cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, 10000);
+		}
 		if ((client->mode != MODE_DFU && client->mode != MODE_RECOVERY) || (client->flags & FLAG_QUIT)) {
 			mutex_unlock(&client->device_event_mutex);
 			if (!(client->flags & FLAG_QUIT)) {
@@ -642,7 +675,20 @@ int dfu_enter_recovery(struct idevicerestore_client_t* client, plist_t build_ide
 	}
 
 	logger(LL_DEBUG, "Waiting for device to disconnect...\n");
-	cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, 10000);
+	cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, (client->macos_variant) ? 5000 : 10000);
+	if (client->macos_variant && client->mode == MODE_RECOVERY && !(client->flags & FLAG_QUIT)) {
+		/* iBEC may be running without a USB detach, or may need a poke to start */
+		int ibec_running = dfu_poke_device(client);
+		if (!ibec_running) {
+			cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, 30000);
+			ibec_running = (client->mode == MODE_RECOVERY && dfu_poke_device(client));
+		}
+		if (ibec_running) {
+			logger(LL_INFO, "iBEC is running (boot-stage 2), continuing.\n");
+			mutex_unlock(&client->device_event_mutex);
+			goto ibec_started;
+		}
+	}
 	if (client->mode != MODE_UNKNOWN || (client->flags & FLAG_QUIT)) {
 		mutex_unlock(&client->device_event_mutex);
 		if (!(client->flags & FLAG_QUIT)) {
@@ -661,6 +707,7 @@ int dfu_enter_recovery(struct idevicerestore_client_t* client, plist_t build_ide
 	}
 	mutex_unlock(&client->device_event_mutex);
 
+ibec_started:
 	if (recovery_client_new(client) < 0) {
 		logger(LL_ERROR, "Unable to connect to recovery device\n");
 		if (client->recovery->client) {
