@@ -1298,6 +1298,77 @@ static int sha1_verify_fp(FILE* f, unsigned char* expected_sha1)
 	return (memcmp(expected_sha1, tsha1, 20) == 0) ? 1 : 0;
 }
 
+/* Write a sidecar file with the verified SHA1 next to the IPSW, together
+ * with the IPSW size and modification time. This allows skipping expensive
+ * re-hashing on subsequent runs when the expected SHA1 matches and the file
+ * hasn't changed. */
+static int write_sha1_sidecar(const char* fwlfn, const unsigned char* sha1buf)
+{
+	struct stat st;
+	if (stat(fwlfn, &st) != 0) {
+		return -1;
+	}
+	char sidecar[PATH_MAX];
+	snprintf(sidecar, sizeof(sidecar), "%s.sha1", fwlfn);
+	FILE* sf = fopen(sidecar, "wb");
+	if (!sf) {
+		return -1;
+	}
+	for (int i = 0; i < 20; i++) {
+		fprintf(sf, "%02x", sha1buf[i]);
+	}
+	fprintf(sf, " %llu %lld\n", (unsigned long long)st.st_size, (long long)st.st_mtime);
+	fclose(sf);
+	return 0;
+}
+
+/* Read the sidecar SHA1 if present and still describing the same IPSW file */
+static int read_sha1_sidecar(const char* fwlfn, unsigned char* sha1buf)
+{
+	struct stat st;
+	if (stat(fwlfn, &st) != 0) {
+		return -1;
+	}
+	char sidecar[PATH_MAX];
+	snprintf(sidecar, sizeof(sidecar), "%s.sha1", fwlfn);
+	FILE* sf = fopen(sidecar, "rb");
+	if (!sf) {
+		return -1;
+	}
+	char line[128] = {0};
+	size_t n = fread(line, 1, sizeof(line)-1, sf);
+	fclose(sf);
+	if (n < 40) {
+		return -1;
+	}
+	for (int i = 0; i < 20; i++) {
+		unsigned int v = 0;
+		if (sscanf(&line[i*2], "%02x", &v) != 1) {
+			return -1;
+		}
+		sha1buf[i] = (unsigned char)v;
+	}
+	/* Sidecars without size/mtime (or with stale ones) are re-verified */
+	unsigned long long size = 0;
+	long long mtime = 0;
+	if (sscanf(&line[40], " %llu %lld", &size, &mtime) != 2 ||
+	    size != (unsigned long long)st.st_size || mtime != (long long)st.st_mtime) {
+		return -1;
+	}
+	return 0;
+}
+
+/* Check env var to optionally skip SHA1 verification entirely */
+static int env_skip_sha1(void)
+{
+	const char* env = getenv("YWME_SKIP_SHA1");
+	if (!env) return 0;
+	if ((strcmp(env, "1") == 0) || (strcmp(env, "true") == 0) || (strcmp(env, "TRUE") == 0) || (strcmp(env, "True") == 0)) {
+		return 1;
+	}
+	return 0;
+}
+
 int ipsw_download_fw(const char *fwurl, unsigned char* isha1, const char* todir, char** ipswfile)
 {
 	char* fwfn = strrchr(fwurl, '/');
@@ -1327,16 +1398,26 @@ int ipsw_download_fw(const char *fwurl, unsigned char* isha1, const char* todir,
 	unsigned char zsha1[20] = {0, };
 	FILE* f = fopen(fwlfn, "rb");
 	if (f) {
-		if (memcmp(zsha1, isha1, 20) != 0) {
-			logger(LL_INFO, "Verifying '%s'...\n", fwlfn);
-			register_progress('SHA1', "Verifying");
-			if (sha1_verify_fp(f, isha1)) {
-				logger(LL_INFO, "Checksum matches.\n");
+		int skip_verify = env_skip_sha1();
+		if (skip_verify) {
+			logger(LL_NOTICE, "YWME_SKIP_SHA1 set: skipping IPSW checksum verification for '%s'\n", fwlfn);
+		} else if (memcmp(zsha1, isha1, 20) != 0) {
+			/* If we have a cached SHA1 sidecar and it matches expected, trust it */
+			unsigned char cached[20] = {0};
+			if (read_sha1_sidecar(fwlfn, cached) == 0 && memcmp(cached, isha1, 20) == 0) {
+				logger(LL_INFO, "Using cached SHA1 for '%s' (previously verified).\n", fwlfn);
 			} else {
-				logger(LL_INFO, "Checksum does not match.\n");
-				need_dl = 1;
+				logger(LL_INFO, "Verifying '%s'...\n", fwlfn);
+				register_progress('SHA1', "Verifying");
+				if (sha1_verify_fp(f, isha1)) {
+					logger(LL_INFO, "Checksum matches.\n");
+					write_sha1_sidecar(fwlfn, isha1);
+				} else {
+					logger(LL_INFO, "Checksum does not match.\n");
+					need_dl = 1;
+				}
+				finalize_progress('SHA1');
 			}
-			finalize_progress('SHA1');
 		}
 		fclose(f);
 	} else {
@@ -1357,25 +1438,31 @@ int ipsw_download_fw(const char *fwurl, unsigned char* isha1, const char* todir,
 				return -1;
 			}
 			if (memcmp(isha1, zsha1, 20) != 0) {
-				logger(LL_INFO, "Verifying '%s'...\n", fwlfn);
-				FILE* f = fopen(fwlfn, "rb");
-				if (f) {
-					register_progress('SHA1', "Verifying");
-					if (sha1_verify_fp(f, isha1)) {
-						logger(LL_INFO, "Checksum matches.\n");
-					} else {
-						logger(LL_ERROR, "File download failed (checksum mismatch).\n");
-						res = -4;
-					}
-					finalize_progress('SHA1');
-					fclose(f);
-
-					// make sure to remove invalid files
-					if (res < 0)
-						remove(fwlfn);
+				int skip_verify = env_skip_sha1();
+				if (skip_verify) {
+					logger(LL_NOTICE, "YWME_SKIP_SHA1 set: skipping IPSW checksum verification for '%s'\n", fwlfn);
 				} else {
-					logger(LL_ERROR, "Can't open '%s' for checksum verification\n", fwlfn);
-					res = -5;
+					logger(LL_INFO, "Verifying '%s'...\n", fwlfn);
+					FILE* f = fopen(fwlfn, "rb");
+					if (f) {
+						register_progress('SHA1', "Verifying");
+						if (sha1_verify_fp(f, isha1)) {
+							logger(LL_INFO, "Checksum matches.\n");
+							write_sha1_sidecar(fwlfn, isha1);
+						} else {
+							logger(LL_ERROR, "File download failed (checksum mismatch).\n");
+							res = -4;
+						}
+						finalize_progress('SHA1');
+						fclose(f);
+
+						// make sure to remove invalid files
+						if (res < 0)
+							remove(fwlfn);
+					} else {
+						logger(LL_ERROR, "Can't open '%s' for checksum verification\n", fwlfn);
+						res = -5;
+					}
 				}
 			}
 		}
