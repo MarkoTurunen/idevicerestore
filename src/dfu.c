@@ -452,7 +452,9 @@ static int dfu_poke_device(struct idevicerestore_client_t* client)
 	int stage2 = 0;
 
 	logger(LL_DEBUG, "Device did not detach yet, re-opening it...\n");
-	if (irecv_open_with_ecid_and_attempts(&dev, client->ecid, 2) != IRECV_E_SUCCESS) {
+	/* A single attempt: the device usually re-enumerates while being opened,
+	 * and a failed open here is expected and harmless. */
+	if (irecv_open_with_ecid(&dev, client->ecid) != IRECV_E_SUCCESS) {
 		return 0;
 	}
 	irecv_get_mode(dev, &mode);
