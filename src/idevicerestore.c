@@ -1845,6 +1845,87 @@ static void handle_signal(int sig)
 	}
 }
 
+#if !defined(WIN32) && defined(__has_include)
+#if __has_include(<execinfo.h>)
+#include <execinfo.h>
+#include <fcntl.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
+#define HAVE_CRASH_BACKTRACE 1
+#endif
+#endif
+
+#ifdef HAVE_CRASH_BACKTRACE
+/* Only async-signal-safe calls from here on: write(2) and backtrace_symbols_fd(). The crash report goes to
+ * stderr, which is the debug log file once logger_set_logfile() reopened it, and to stdout, which YWME
+ * copies into the port log. */
+static void crash_write(const char* s)
+{
+	ssize_t r = write(STDERR_FILENO, s, strlen(s));
+	r = write(STDOUT_FILENO, s, strlen(s));
+	(void)r;
+}
+
+static void crash_write_number(unsigned long long value, int base)
+{
+	char buf[32];
+	int i = sizeof(buf) - 1;
+	buf[i] = '\0';
+	do {
+		buf[--i] = "0123456789abcdef"[value % base];
+		value /= base;
+	} while (value && i > 0);
+	crash_write(buf + i);
+}
+
+/* idevicerestore died with SIGSEGV (exit 139) with nothing in its log (#79). Print the faulting thread's
+ * backtrace to stderr, which YWME copies into the port log, then die from the same signal as before. The
+ * frames are "binary(+offset)": resolve them with addr2line -e on an unstripped build of the same commit. */
+static void crash_handler(int sig, siginfo_t* info, void* context)
+{
+	void* frames[64];
+	int count;
+	(void)context;
+
+	crash_write("\nidevicerestore crashed: ");
+	crash_write((sig == SIGSEGV) ? "SIGSEGV" : (sig == SIGBUS) ? "SIGBUS" : (sig == SIGFPE) ? "SIGFPE" : (sig == SIGILL) ? "SIGILL" : "SIGABRT");
+	crash_write(" at address 0x");
+	crash_write_number((unsigned long long)(uintptr_t)((info) ? info->si_addr : NULL), 16);
+#ifdef __linux__
+	crash_write(" in thread ");
+	crash_write_number((unsigned long long)syscall(SYS_gettid), 10);
+#endif
+	crash_write(" (" PACKAGE_VERSION "), backtrace:\n");
+	count = backtrace(frames, 64);
+	backtrace_symbols_fd(frames, count, STDERR_FILENO);
+	backtrace_symbols_fd(frames, count, STDOUT_FILENO);
+	crash_write("idevicerestore crash backtrace end\n");
+
+	/* SA_RESETHAND restored the default action: the exit status stays that of the signal */
+	raise(sig);
+}
+
+static void install_crash_handler(void)
+{
+	void* frame[1];
+	int sigs[] = { SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGABRT };
+	unsigned int i;
+	struct sigaction sa;
+
+	/* the first backtrace() loads libgcc_s, which must not happen inside the handler */
+	backtrace(frame, 1);
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_sigaction = crash_handler;
+	sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
+	sigemptyset(&sa.sa_mask);
+	for (i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++) {
+		sigaction(sigs[i], &sa, NULL);
+	}
+}
+#endif
+
 void plain_progress_cb(int step, double step_progress, void* userdata)
 {
 	printf("progress: %u %f\n", step, step_progress);
@@ -1918,6 +1999,9 @@ int main(int argc, char* argv[])
 	sigaction(SIGQUIT, &sa, NULL);
 	sa.sa_handler = SIG_IGN;
 	sigaction(SIGPIPE, &sa, NULL);
+#ifdef HAVE_CRASH_BACKTRACE
+	install_crash_handler();
+#endif
 #endif
 
 	if (!isatty(fileno(stdin)) || !isatty(fileno(stdout))) {
