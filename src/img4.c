@@ -402,6 +402,80 @@ static const char *_img4_get_component_tag(const char *compname)
 	return NULL;
 }
 
+/* Reads one DER element header at *off (high tag numbers included) and leaves *off at its content.
+ * Returns -1 when the header or the content length does not fit into size. */
+static int der_read_header(const unsigned char* buf, size_t size, size_t* off, unsigned char* tag, size_t* len)
+{
+	if (*off >= size) {
+		return -1;
+	}
+	*tag = buf[(*off)++];
+	if ((*tag & 0x1f) == 0x1f) {
+		/* high tag number: base-128 bytes, the last one without bit 7 */
+		int n = 0;
+		do {
+			if (*off >= size || ++n > 5) {
+				return -1;
+			}
+		} while (buf[(*off)++] & 0x80);
+	}
+	if (*off >= size) {
+		return -1;
+	}
+	unsigned char l = buf[(*off)++];
+	if (l & 0x80) {
+		int n = l & 0x7f;
+		size_t v = 0;
+		if (n == 0 || n > 4 || *off + n > size) {
+			return -1;
+		}
+		while (n--) {
+			v = (v << 8) | buf[(*off)++];
+		}
+		*len = v;
+	} else {
+		*len = l;
+	}
+	if (*len > size - *off) {
+		return -1;
+	}
+	return 0;
+}
+
+char* img4_get_component_description(const void* data, size_t size)
+{
+	const unsigned char* buf = (const unsigned char*)data;
+	size_t off = 0;
+	size_t len = 0;
+	unsigned char tag = 0;
+	int i;
+
+	if (!data || der_read_header(buf, size, &off, &tag, &len) < 0 || tag != (ASN1_CONSTRUCTED | ASN1_SEQUENCE)) {
+		return NULL;
+	}
+	size_t end = off + len;
+	/* IM4P: SEQUENCE { "IM4P", type, description, payload, ... } */
+	for (i = 0; i < 3; i++) {
+		if (der_read_header(buf, end, &off, &tag, &len) < 0 || tag != ASN1_IA5_STRING) {
+			return NULL;
+		}
+		if (i == 0 && (len != 4 || memcmp(buf + off, "IM4P", 4) != 0)) {
+			return NULL;
+		}
+		if (i == 2) {
+			char* desc = (char*)malloc(len + 1);
+			if (!desc) {
+				return NULL;
+			}
+			memcpy(desc, buf + off, len);
+			desc[len] = '\0';
+			return desc;
+		}
+		off += len;
+	}
+	return NULL;
+}
+
 int img4_stitch_component(const char* component_name, const void* component_data, size_t component_size, plist_t parameters, plist_t tss_response, void** img4_data, size_t *img4_size)
 {
 	unsigned char* magic_header = NULL;

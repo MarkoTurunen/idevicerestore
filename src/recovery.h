@@ -46,6 +46,11 @@ int recovery_enter_restore(struct idevicerestore_client_t* client, plist_t build
 int recovery_send_component(struct idevicerestore_client_t* client, plist_t build_identity, const char* component);
 int recovery_send_component_and_command(struct idevicerestore_client_t* client, plist_t build_identity, const char* component, const char* command);
 int recovery_send_ibec(struct idevicerestore_client_t* client, plist_t build_identity);
+char* recovery_get_component_version(struct idevicerestore_client_t* client, plist_t build_identity, const char* component);
+char* recovery_get_iboot_build_version(struct idevicerestore_client_t* client);
+/* Compares the iBoot build-version before and after the iBEC with the iBEC's version. Returns -1 (and logs
+ * "The iBEC did not run") when the device still runs its previous iBoot of another major version. */
+int recovery_check_ibec_running(const char* iboot_before, const char* iboot_after, const char* ibec_version);
 int recovery_send_applelogo(struct idevicerestore_client_t* client, plist_t build_identity);
 int recovery_send_devicetree(struct idevicerestore_client_t* client, plist_t build_identity);
 int recovery_send_ramdisk(struct idevicerestore_client_t* client, plist_t build_identity);

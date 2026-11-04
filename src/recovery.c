@@ -33,6 +33,8 @@
 
 #include "idevicerestore.h"
 #include "img3.h"
+#include "img4.h"
+#include "ipsw.h"
 #include "restore.h"
 #include "recovery.h"
 
@@ -344,6 +346,85 @@ int recovery_send_component_and_command(struct idevicerestore_client_t* client, 
 	}
 
 	return 0;
+}
+
+/* The version of an iBoot stage in the IPSW (the description of its IM4P, e.g. "iBoot-11881.140.96.700.4"),
+ * or NULL when it has none (IMG3) or cannot be read. */
+char* recovery_get_component_version(struct idevicerestore_client_t* client, plist_t build_identity, const char* component)
+{
+	char* path = NULL;
+	void* data = NULL;
+	size_t size = 0;
+	char* version = NULL;
+
+	if (client->tss) {
+		tss_response_get_path_by_entry(client->tss, component, &path);
+	}
+	if (!path && build_identity_get_component_path(build_identity, component, &path) < 0) {
+		free(path);
+		return NULL;
+	}
+	if (ipsw_extract_to_memory(client->ipsw, path, &data, &size) == 0) {
+		version = img4_get_component_description(data, size);
+	}
+	free(path);
+	free(data);
+	return version;
+}
+
+/* The build-version iBoot reports in Recovery mode, or NULL. Opens the recovery client when needed. */
+char* recovery_get_iboot_build_version(struct idevicerestore_client_t* client)
+{
+	char* value = NULL;
+
+	if (client->recovery == NULL) {
+		if (recovery_client_new(client) < 0) {
+			return NULL;
+		}
+	}
+	if (irecv_getenv(client->recovery->client, "build-version", &value) != IRECV_E_SUCCESS) {
+		free(value);
+		return NULL;
+	}
+	return value;
+}
+
+/* The major version of an iBoot version string ("iBoot-10151.62.1" -> 10151), or 0. */
+static unsigned long iboot_major_version(const char* version)
+{
+	if (!version || strncmp(version, "iBoot-", 6) != 0) {
+		return 0;
+	}
+	return strtoul(version + 6, NULL, 10);
+}
+
+int recovery_check_ibec_running(const char* iboot_before, const char* iboot_after, const char* ibec_version)
+{
+	unsigned long after_major = iboot_major_version(iboot_after);
+	unsigned long ibec_major = iboot_major_version(ibec_version);
+
+	logger(LL_INFO, "iBoot build-version before the iBEC: %s, after it: %s, iBEC in the IPSW: %s\n",
+		(iboot_before) ? iboot_before : "(unknown)", (iboot_after) ? iboot_after : "(unknown)",
+		(ibec_version) ? ibec_version : "(unknown)");
+	if (!iboot_before || !iboot_after) {
+		return 0;
+	}
+	if (after_major && after_major == ibec_major) {
+		return 0;
+	}
+	if (strcmp(iboot_before, iboot_after) != 0) {
+		if (ibec_major) {
+			logger(LL_WARNING, "iBoot build-version changed after the iBEC, but is not the iBEC's version\n");
+		}
+		return 0;
+	}
+	if (!ibec_major || !after_major) {
+		logger(LL_WARNING, "iBoot build-version did not change after the iBEC; cannot tell whether the iBEC runs\n");
+		return 0;
+	}
+	/* The device reconnected with the iBoot it had before, a different major version than the iBEC (#76). */
+	logger(LL_ERROR, "The iBEC did not run: the device came back in Recovery mode with its previous iBoot %s instead of the iBEC %s\n", iboot_after, ibec_version);
+	return -1;
 }
 
 int recovery_send_ibec(struct idevicerestore_client_t* client, plist_t build_identity)

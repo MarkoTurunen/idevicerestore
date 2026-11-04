@@ -1519,12 +1519,18 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 			}
 		}
 
+		/* The iBoot the device runs now and the iBEC's version, to tell afterwards whether the iBEC runs (#76) */
+		char* iboot_before = recovery_get_iboot_build_version(client);
+		char* ibec_version = recovery_get_component_version(client, build_identity, "iBEC");
+
 		mutex_lock(&client->device_event_mutex);
 
 		/* now we load the iBEC */
 		if (recovery_send_ibec(client, build_identity) < 0) {
 			mutex_unlock(&client->device_event_mutex);
 			logger(LL_ERROR, "Unable to send iBEC\n");
+			free(iboot_before);
+			free(ibec_version);
 			return -2;
 		}
 		recovery_client_free(client);
@@ -1537,6 +1543,8 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 			if (!(client->flags & FLAG_QUIT)) {
 				logger(LL_ERROR, "Device did not disconnect. Possibly invalid iBEC. Reset device and try again.\n");
 			}
+			free(iboot_before);
+			free(ibec_version);
 			return -2;
 		}
 		recovery_client_free(client);
@@ -1547,9 +1555,21 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 			if (!(client->flags & FLAG_QUIT)) {
 				logger(LL_ERROR, "Device did not reconnect in recovery mode. Possibly invalid iBEC. Reset device and try again.\n");
 			}
+			free(iboot_before);
+			free(ibec_version);
 			return -2;
 		}
 		mutex_unlock(&client->device_event_mutex);
+
+		char* iboot_after = recovery_get_iboot_build_version(client);
+		int ibec_running = recovery_check_ibec_running(iboot_before, iboot_after, ibec_version);
+		free(iboot_before);
+		free(iboot_after);
+		free(ibec_version);
+		if (ibec_running < 0) {
+			recovery_client_free(client);
+			return -2;
+		}
 	}
 	idevicerestore_progress(client, RESTORE_STEP_PREPARE, 0.5);
 	if (client->flags & FLAG_QUIT) {
