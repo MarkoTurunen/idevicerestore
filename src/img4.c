@@ -23,6 +23,7 @@
 #include <string.h>
 
 #include <libtatsu/tss.h>
+#include <libimobiledevice-glue/sha.h>
 
 #include "common.h"
 #include "img4.h"
@@ -474,6 +475,117 @@ char* img4_get_component_description(const void* data, size_t size)
 		off += len;
 	}
 	return NULL;
+}
+
+/* Looks in [off, end) and below for a SEQUENCE { IA5String name, value, ... } (an IM4M entry such as
+ * "rkrn" or "DGST") and returns the tag and content range of its value. */
+static int der_find_named_value(const unsigned char* buf, size_t off, size_t end, const char* name,
+	unsigned char* value_tag, size_t* value_off, size_t* value_len, int depth)
+{
+	size_t name_len = strlen(name);
+	if (depth > 10) {
+		return -1;
+	}
+	while (off < end) {
+		unsigned char tag = 0;
+		size_t len = 0;
+		size_t content = off;
+		if (der_read_header(buf, end, &content, &tag, &len) < 0) {
+			return -1;
+		}
+		if (tag & ASN1_CONSTRUCTED) {
+			if (tag == (ASN1_CONSTRUCTED | ASN1_SEQUENCE)) {
+				size_t p = content;
+				unsigned char t = 0;
+				size_t l = 0;
+				if (der_read_header(buf, content + len, &p, &t, &l) == 0 && t == ASN1_IA5_STRING
+						&& l == name_len && memcmp(buf + p, name, l) == 0) {
+					p += l;
+					if (der_read_header(buf, content + len, &p, value_tag, value_len) == 0) {
+						*value_off = p;
+						return 0;
+					}
+				}
+			}
+			if (der_find_named_value(buf, content, content + len, name, value_tag, value_off, value_len, depth + 1) == 0) {
+				return 0;
+			}
+		}
+		off = content + len;
+	}
+	return -1;
+}
+
+static char* hex_prefix(const unsigned char* data, size_t len)
+{
+	size_t n = (len > 8) ? 8 : len;
+	char* out = (char*)malloc(n * 2 + 1);
+	size_t i;
+	if (!out) {
+		return NULL;
+	}
+	for (i = 0; i < n; i++) {
+		sprintf(out + i * 2, "%02x", data[i]);
+	}
+	out[n * 2] = '\0';
+	return out;
+}
+
+void img4_log_ticket_entry(const char* component_name, const void* component_data, size_t component_size, plist_t tss_response, plist_t build_identity)
+{
+	unsigned char* ticket = NULL;
+	unsigned int ticket_size = 0;
+	const char* tag = _img4_get_component_tag(component_name);
+	if (!tag || !tss_response || tss_response_get_ap_img4_ticket(tss_response, &ticket, &ticket_size) != 0 || !ticket) {
+		return;
+	}
+
+	unsigned char vtag = 0;
+	size_t set_off = 0;
+	size_t set_len = 0;
+	if (der_find_named_value(ticket, 0, ticket_size, tag, &vtag, &set_off, &set_len, 0) < 0 || vtag != (ASN1_CONSTRUCTED | ASN1_SET)) {
+		logger(LL_WARNING, "ApImg4Ticket has no entry for %s (%s)\n", component_name, tag);
+		free(ticket);
+		return;
+	}
+	size_t dgst_off = 0;
+	size_t dgst_len = 0;
+	if (der_find_named_value(ticket, set_off, set_off + set_len, "DGST", &vtag, &dgst_off, &dgst_len, 0) < 0 || vtag != ASN1_OCTET_STRING) {
+		logger(LL_WARNING, "ApImg4Ticket entry for %s (%s) has no digest\n", component_name, tag);
+		free(ticket);
+		return;
+	}
+
+	/* the digest the BuildManifest gives for the component, which the ticket was requested with */
+	uint64_t manifest_len = 0;
+	const unsigned char* manifest_digest = NULL;
+	plist_t node = plist_access_path(build_identity, 3, "Manifest", component_name, "Digest");
+	if (node && plist_get_node_type(node) == PLIST_DATA) {
+		manifest_digest = (const unsigned char*)plist_get_data_ptr(node, &manifest_len);
+	}
+
+	/* the digest of the IM4P as it is in the IPSW */
+	unsigned char image_digest[64];
+	size_t image_len = 0;
+	if (component_data && dgst_len == 48) {
+		sha384((const unsigned char*)component_data, component_size, image_digest);
+		image_len = 48;
+	} else if (component_data && dgst_len == 20) {
+		sha1((const unsigned char*)component_data, component_size, image_digest);
+		image_len = 20;
+	}
+
+	const unsigned char* dgst = ticket + dgst_off;
+	int ticket_matches_manifest = manifest_digest && manifest_len == dgst_len && memcmp(manifest_digest, dgst, dgst_len) == 0;
+	int image_matches_ticket = image_len == dgst_len && memcmp(image_digest, dgst, dgst_len) == 0;
+	char* hex = hex_prefix(dgst, dgst_len);
+	logger((ticket_matches_manifest && (!image_len || image_matches_ticket)) ? LL_INFO : LL_WARNING,
+		"ApImg4Ticket entry for %s (%s): digest %s..., %s the BuildManifest, image in the IPSW %s\n",
+		component_name, tag, (hex) ? hex : "?",
+		(!manifest_digest) ? "no digest in" : (ticket_matches_manifest ? "matches" : "DIFFERS from"),
+		(!image_len) ? "not hashed" : (image_matches_ticket ? "matches" : "differs"));
+	free(hex);
+	free(ticket);
 }
 
 int img4_stitch_component(const char* component_name, const void* component_data, size_t component_size, plist_t parameters, plist_t tss_response, void** img4_data, size_t *img4_size)

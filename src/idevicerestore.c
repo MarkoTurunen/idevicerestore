@@ -1563,7 +1563,8 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 
 		char* iboot_after = recovery_get_iboot_build_version(client);
 		int ibec_running = recovery_check_ibec_running(iboot_before, iboot_after, ibec_version);
-		free(iboot_before);
+		free(client->iboot_before_ibec);
+		client->iboot_before_ibec = iboot_before;
 		free(iboot_after);
 		free(ibec_version);
 		if (ibec_running < 0) {
@@ -1640,6 +1641,10 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 				logger(LL_ERROR, "Make sure that usbmuxd is running.\n");
 			} else if (client->mode == MODE_RECOVERY || client->mode == MODE_DFU) {
 				logger(LL_ERROR, "Device reconnected in %s mode, most likely image personalization failed.\n", client->mode->string);
+				if (client->mode == MODE_RECOVERY) {
+					/* which iBoot it is back in, and with which nonce, tells more than the guess above (#78) */
+					recovery_log_reconnect_state(client, build_identity);
+				}
 			}
 			return -1;
 		}
@@ -1714,6 +1719,7 @@ void idevicerestore_client_free(struct idevicerestore_client_t* client)
 		idevice_event_unsubscribe();
 	}
 	cond_destroy(&client->device_event_cond);
+	free(client->iboot_before_ibec);
 	mutex_destroy(&client->device_event_mutex);
 
 	if (client->tss_url) {

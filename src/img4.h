@@ -30,6 +30,9 @@ int img4_stitch_component(const char* component_name, const void* component_data
 int img4_create_local_manifest(plist_t request, plist_t build_identity, plist_t* manifest);
 /* The description of an IM4P (for iBoot stages its version, e.g. "iBoot-11881.140.96.700.4"), or NULL. */
 char* img4_get_component_description(const void* data, size_t size);
+/* Logs whether the ApImg4Ticket of the TSS response has an entry for the component and whether its
+ * digest is the BuildManifest's and the IPSW image's, so a log shows which image iBoot could reject. */
+void img4_log_ticket_entry(const char* component_name, const void* component_data, size_t component_size, plist_t tss_response, plist_t build_identity);
 
 #ifdef __cplusplus
 }

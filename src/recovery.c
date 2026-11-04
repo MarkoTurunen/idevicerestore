@@ -308,6 +308,9 @@ int recovery_send_component(struct idevicerestore_client_t* client, plist_t buil
 		return -1;
 	}
 
+	if (client->tss && plist_dict_get_item(client->tss, "ApImg4Ticket")) {
+		img4_log_ticket_entry(component, component_data, component_size, client->tss, build_identity);
+	}
 	ret = personalize_component(client, component, component_data, component_size, client->tss, &data, &size);
 	free(component_data);
 	if (ret < 0) {
@@ -425,6 +428,59 @@ int recovery_check_ibec_running(const char* iboot_before, const char* iboot_afte
 	/* The device reconnected with the iBoot it had before, a different major version than the iBEC (#76). */
 	logger(LL_ERROR, "The iBEC did not run: the device came back in Recovery mode with its previous iBoot %s instead of the iBEC %s\n", iboot_after, ibec_version);
 	return -1;
+}
+
+/* Whether the build-version iBoot reports ("iBoot-11881.140.96") is that of a version string from the
+ * IPSW, which can be longer ("iBoot-11881.140.96.700.4"). */
+static int iboot_version_matches(const char* reported, const char* version)
+{
+	size_t n;
+	if (!reported || !version) {
+		return 0;
+	}
+	n = strlen(reported);
+	return strncmp(reported, version, n) == 0 && (version[n] == '\0' || version[n] == '.');
+}
+
+void recovery_log_reconnect_state(struct idevicerestore_client_t* client, plist_t build_identity)
+{
+	const char* vars[] = { "build-version", "build-style", "boot-args", "auto-boot", NULL };
+	char* build_version = NULL;
+	int i;
+
+	recovery_client_free(client);
+	if (recovery_client_new(client) < 0) {
+		logger(LL_WARNING, "Cannot open the device in Recovery mode to read its iBoot environment\n");
+		return;
+	}
+	for (i = 0; vars[i]; i++) {
+		char* value = NULL;
+		irecv_getenv(client->recovery->client, vars[i], &value);
+		logger(LL_INFO, "Back in Recovery mode after the kernel cache: iBoot %s=%s\n", vars[i], (value) ? value : "(unset)");
+		if (i == 0) {
+			build_version = value;
+		} else {
+			free(value);
+		}
+	}
+
+	char* ibec_version = recovery_get_component_version(client, build_identity, "iBEC");
+	const char* before = client->iboot_before_ibec;
+	if (build_version && ibec_version && iboot_version_matches(build_version, ibec_version) && !iboot_version_matches(before, ibec_version)) {
+		logger(LL_INFO, "The device is back in the iBEC (%s): the iBEC did not boot the restore ramdisk and kernel cache\n", ibec_version);
+	} else if (build_version && before && strcmp(build_version, before) == 0 && !iboot_version_matches(before, ibec_version)) {
+		logger(LL_INFO, "The device is back in its own iBoot (%s), not the iBEC (%s): it rebooted after the iBEC jumped to the restore kernel\n", build_version, (ibec_version) ? ibec_version : "unknown");
+	} else {
+		logger(LL_INFO, "Cannot tell from build-version whether the device is back in the iBEC (%s) or in its own iBoot (%s)\n", (ibec_version) ? ibec_version : "unknown", (before) ? before : "unknown");
+	}
+	free(ibec_version);
+	free(build_version);
+
+	const struct irecv_device_info *device_info = irecv_get_device_info(client->recovery->client);
+	if (device_info && device_info->ap_nonce && device_info->ap_nonce_size > 0 && client->nonce && client->nonce_size > 0) {
+		int same = (device_info->ap_nonce_size == (unsigned int)client->nonce_size) && memcmp(device_info->ap_nonce, client->nonce, client->nonce_size) == 0;
+		logger(LL_INFO, "ApNonce %s the one the ApImg4Ticket was requested with\n", (same) ? "is still" : "is no longer");
+	}
 }
 
 int recovery_send_ibec(struct idevicerestore_client_t* client, plist_t build_identity)

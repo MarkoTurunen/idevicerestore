@@ -51,6 +51,9 @@ char* recovery_get_iboot_build_version(struct idevicerestore_client_t* client);
 /* Compares the iBoot build-version before and after the iBEC with the iBEC's version. Returns -1 (and logs
  * "The iBEC did not run") when the device still runs its previous iBoot of another major version. */
 int recovery_check_ibec_running(const char* iboot_before, const char* iboot_after, const char* ibec_version);
+/* After the device came back in Recovery mode instead of restore mode: logs its iBoot environment, whether
+ * it is back in the iBEC or in its own iBoot, and whether its ApNonce changed. */
+void recovery_log_reconnect_state(struct idevicerestore_client_t* client, plist_t build_identity);
 int recovery_send_applelogo(struct idevicerestore_client_t* client, plist_t build_identity);
 int recovery_send_devicetree(struct idevicerestore_client_t* client, plist_t build_identity);
 int recovery_send_ramdisk(struct idevicerestore_client_t* client, plist_t build_identity);

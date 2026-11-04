@@ -128,6 +128,7 @@ struct idevicerestore_client_t {
 	char* filesystem;
 	int delete_fs;
 	int async_err;
+	char* iboot_before_ibec; /* iBoot build-version before the iBEC was sent from Recovery mode */
 };
 
 extern int global_quit_flag;
