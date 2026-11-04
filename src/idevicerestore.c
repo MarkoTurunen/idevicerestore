@@ -35,6 +35,7 @@
 #include <zlib.h>
 #include <libgen.h>
 #include <signal.h>
+#include <sys/time.h>
 
 #include <curl/curl.h>
 
@@ -279,6 +280,8 @@ static void idevice_event_cb(const idevice_event_t *event, void *userdata)
 		if (client->ignore_device_add_events) {
 			return;
 		}
+		/* logged for every device, so a log shows whether usbmuxd reported the device at all */
+		logger(LL_DEBUG, "%s: usbmuxd added device with UDID %s\n", __func__, event->udid ? event->udid : "(none)");
 		if (normal_check_mode(client) == 0) {
 			mutex_lock(&client->device_event_mutex);
 			client->mode = MODE_NORMAL;
@@ -296,7 +299,10 @@ static void idevice_event_cb(const idevice_event_t *event, void *userdata)
 			client->device = get_irecv_device(client);
 		}
 	} else if (event->event == IDEVICE_DEVICE_REMOVE) {
-		if (client->udid && !strcmp(event->udid, client->udid)) {
+		if (!client->ignore_device_add_events) {
+			logger(LL_DEBUG, "%s: usbmuxd removed device with UDID %s\n", __func__, event->udid ? event->udid : "(none)");
+		}
+		if (client->udid && event->udid && !strcmp(event->udid, client->udid)) {
 			mutex_lock(&client->device_event_mutex);
 			client->mode = MODE_UNKNOWN;
 			logger(LL_DEBUG, "%s: device %016" PRIx64 " (udid: %s) disconnected\n", __func__, client->ecid, client->udid);
@@ -361,6 +367,69 @@ static void irecv_event_cb(const irecv_device_event_t* event, void *userdata)
 
 int build_identity_check_components_in_ipsw(plist_t build_identity, ipsw_archive_t ipsw);
 
+static long long now_ms(void)
+{
+	struct timeval tv;
+	gettimeofday(&tv, NULL);
+	return (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+/* Waits up to 300 s for the device to come up in restore mode. Called and returns with
+ * device_event_mutex held.
+ * idevice_event_cb() checks for the restore-mode device once per usbmuxd add event. When that one check
+ * fails (restored not answering yet), or the add event does not arrive, the device was never taken and
+ * the restore OS gave up after its own timeout (#63). So while no device event says otherwise, the
+ * device list is checked here every 5 s as well, and every 30 s the number of devices usbmuxd lists is
+ * logged. The wait ends early when the device shows up in another mode (back in Recovery or DFU). */
+static void wait_for_restore_mode(struct idevicerestore_client_t* client)
+{
+	const long long timeout_ms = 300000;
+	const long long poll_ms = 5000;
+	long long started = now_ms();
+	long long next_report = started + 30000;
+
+	while (client->mode != MODE_RESTORE && !(client->flags & FLAG_QUIT)) {
+		long long left = started + timeout_ms - now_ms();
+		if (left <= 0) {
+			break;
+		}
+		int res = cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, (unsigned int)((left < poll_ms) ? left : poll_ms));
+		if (client->mode == MODE_RESTORE || (client->flags & FLAG_QUIT)) {
+			break;
+		}
+		if (res == 0 && client->mode != MODE_UNKNOWN) {
+			/* signalled: the device is back in another mode */
+			break;
+		}
+
+		mutex_unlock(&client->device_event_mutex);
+		int found = (restore_check_mode(client) == 0);
+		if (!found && now_ms() >= next_report) {
+			char **devices = NULL;
+			int num_devices = 0;
+			idevice_error_t list_error = idevice_get_device_list(&devices, &num_devices);
+			if (list_error == IDEVICE_E_SUCCESS) {
+				logger(LL_DEBUG, "Device not in restore mode after %lld s, usbmuxd lists %d device(s)\n", (now_ms() - started) / 1000, num_devices);
+			} else {
+				logger(LL_DEBUG, "Device not in restore mode after %lld s, cannot get the device list from usbmuxd (%d)\n", (now_ms() - started) / 1000, list_error);
+			}
+			if (devices) {
+				idevice_device_list_free(devices);
+			}
+			next_report += 30000;
+		}
+		mutex_lock(&client->device_event_mutex);
+		if (found && client->mode != MODE_RESTORE) {
+			if (client->mode != MODE_UNKNOWN) {
+				/* an event put it into another mode meanwhile; that one wins */
+				break;
+			}
+			client->mode = MODE_RESTORE;
+			logger(LL_DEBUG, "%s: device %016" PRIx64 " (udid: %s) found in restore mode by polling after %lld s\n", __func__, client->ecid, client->udid ? client->udid : "N/A", (now_ms() - started) / 1000);
+		}
+	}
+}
+
 int idevicerestore_start(struct idevicerestore_client_t* client)
 {
 	int tss_enabled = 0;
@@ -400,6 +469,8 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 	}
 
 	if (!client->idevice_e_ctx) {
+		const char* usbmuxd_address = getenv("USBMUXD_SOCKET_ADDRESS");
+		logger(LL_DEBUG, "Subscribing to usbmuxd device events (USBMUXD_SOCKET_ADDRESS=%s)\n", usbmuxd_address ? usbmuxd_address : "(not set, default socket)");
 		idevice_event_subscribe(idevice_event_cb, client);
 		client->idevice_e_ctx = idevice_event_cb;
 	}
@@ -1541,7 +1612,7 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 	if (client->mode != MODE_RESTORE) {
 		mutex_lock(&client->device_event_mutex);
 		logger(LL_INFO, "Waiting for device to enter restore mode...\n");
-		cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, 300000);
+		wait_for_restore_mode(client);
 		if (client->mode != MODE_RESTORE || (client->flags & FLAG_QUIT)) {
 			mutex_unlock(&client->device_event_mutex);
 			logger(LL_ERROR, "Device failed to enter restore mode.\n");

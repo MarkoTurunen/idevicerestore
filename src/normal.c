@@ -42,10 +42,14 @@ static int normal_idevice_new(struct idevicerestore_client_t* client, idevice_t*
 	idevice_t dev = NULL;
 	idevice_error_t device_error;
 	lockdownd_client_t lockdown = NULL;
+	lockdownd_error_t lockdown_error;
 	plist_t node = NULL;
 
 	*device = NULL;
 
+	/* Every rejected device is logged at debug level, and every lockdown connection is closed again: a
+	 * device in restore mode answers on the lockdown port too (restored), and a connection left open
+	 * there could keep restored busy while restore_idevice_new() connects to it. */
 	if (client->udid) {
 		device_error = idevice_new(&dev, client->udid);
 		if (device_error != IDEVICE_E_SUCCESS) {
@@ -53,17 +57,25 @@ static int normal_idevice_new(struct idevicerestore_client_t* client, idevice_t*
 			return -1;
 		}
 
-		if (lockdownd_client_new(dev, &lockdown, "idevicerestore") != LOCKDOWN_E_SUCCESS) {
+		lockdown_error = lockdownd_client_new(dev, &lockdown, "idevicerestore");
+		if (lockdown_error != LOCKDOWN_E_SUCCESS) {
 			logger(LL_ERROR, "%s: can't connect to lockdownd on device with UDID %s\n", __func__, client->udid);
+			idevice_free(dev);
 			return -1;
-
 		}
 		char* type = NULL;
-		if (lockdownd_query_type(lockdown, &type) != LOCKDOWN_E_SUCCESS) {
+		lockdown_error = lockdownd_query_type(lockdown, &type);
+		if (lockdown_error != LOCKDOWN_E_SUCCESS) {
+			logger(LL_DEBUG, "%s: device with UDID %s did not answer QueryType (%d)\n", __func__, client->udid, lockdown_error);
+			lockdownd_client_free(lockdown);
+			idevice_free(dev);
 			return -1;
 		}
 		if (strcmp(type, "com.apple.mobile.lockdown") != 0) {
+			logger(LL_DEBUG, "%s: device with UDID %s is not in normal mode (type %s)\n", __func__, client->udid, type);
 			free(type);
+			lockdownd_client_free(lockdown);
+			idevice_free(dev);
 			return -1;
 		}
 		free(type);
@@ -78,8 +90,10 @@ static int normal_idevice_new(struct idevicerestore_client_t* client, idevice_t*
 		return 0;
 	}
 
-	idevice_get_device_list(&devices, &num_devices);
-	if (num_devices == 0) {
+	if (idevice_get_device_list(&devices, &num_devices) != IDEVICE_E_SUCCESS || num_devices == 0) {
+		if (devices) {
+			idevice_device_list_free(devices);
+		}
 		return -1;
 	}
 	int j;
@@ -98,16 +112,20 @@ static int normal_idevice_new(struct idevicerestore_client_t* client, idevice_t*
 			continue;
 		}
 
-		if (lockdownd_client_new(dev, &lockdown, "idevicerestore") != LOCKDOWN_E_SUCCESS) {
-			logger(LL_ERROR, "%s: can't connect to lockdownd on device with UDID %s\n", __func__, devices[j]);
+		lockdown_error = lockdownd_client_new(dev, &lockdown, "idevicerestore");
+		if (lockdown_error != LOCKDOWN_E_SUCCESS) {
+			logger(LL_DEBUG, "%s: can't connect to lockdownd on device with UDID %s (%d)\n", __func__, devices[j], lockdown_error);
+			lockdown = NULL;
 			continue;
-
 		}
 		char* type = NULL;
-		if (lockdownd_query_type(lockdown, &type) != LOCKDOWN_E_SUCCESS) {
+		lockdown_error = lockdownd_query_type(lockdown, &type);
+		if (lockdown_error != LOCKDOWN_E_SUCCESS) {
+			logger(LL_DEBUG, "%s: device with UDID %s did not answer QueryType (%d)\n", __func__, devices[j], lockdown_error);
 			continue;
 		}
 		if (strcmp(type, "com.apple.mobile.lockdown") != 0) {
+			logger(LL_DEBUG, "%s: device with UDID %s is not in normal mode (type %s)\n", __func__, devices[j], type);
 			free(type);
 			continue;
 		}
@@ -115,6 +133,7 @@ static int normal_idevice_new(struct idevicerestore_client_t* client, idevice_t*
 
 		node = NULL;
 		if ((lockdownd_get_value(lockdown, NULL, "UniqueChipID", &node) != LOCKDOWN_E_SUCCESS) || !node || (plist_get_node_type(node) != PLIST_UINT)){
+			logger(LL_DEBUG, "%s: device with UDID %s did not report its UniqueChipID\n", __func__, devices[j]);
 			if (node) {
 				plist_free(node);
 			}
@@ -129,6 +148,7 @@ static int normal_idevice_new(struct idevicerestore_client_t* client, idevice_t*
 
 		if (client->ecid != 0) {
 			if (this_ecid != client->ecid) {
+				logger(LL_DEBUG, "%s: device with UDID %s has ECID %016" PRIx64 ", not %016" PRIx64 "\n", __func__, devices[j], this_ecid, client->ecid);
 				continue;
 			}
 		} else {
@@ -136,7 +156,14 @@ static int normal_idevice_new(struct idevicerestore_client_t* client, idevice_t*
 		}
 		client->udid = strdup(devices[j]);
 		*device = dev;
+		dev = NULL;
 		break;
+	}
+	if (lockdown != NULL) {
+		lockdownd_client_free(lockdown);
+	}
+	if (dev != NULL) {
+		idevice_free(dev);
 	}
 	idevice_device_list_free(devices);
 

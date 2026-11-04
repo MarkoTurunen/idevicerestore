@@ -29,6 +29,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/time.h>
 #include <libgen.h>
 #include <math.h>
 #include <libimobiledevice/restore.h>
@@ -160,18 +161,36 @@ void restore_client_free(struct idevicerestore_client_t* client)
 	}
 }
 
+static long long restore_now_ms(void)
+{
+	struct timeval tv;
+	gettimeofday(&tv, NULL);
+	return (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+/* Finds the device in restore mode among the devices usbmuxd lists. Every device that is passed over is
+ * logged at debug level with the reason (and how long restored took to answer), so a log shows why a
+ * device that usbmuxd has in restore mode was not taken. */
 static int restore_idevice_new(struct idevicerestore_client_t* client, idevice_t* device)
 {
 	int num_devices = 0;
 	char **devices = NULL;
-	idevice_get_device_list(&devices, &num_devices);
-	if (num_devices == 0) {
+	idevice_error_t list_error = idevice_get_device_list(&devices, &num_devices);
+	if (list_error != IDEVICE_E_SUCCESS || num_devices == 0) {
+		if (list_error != IDEVICE_E_SUCCESS) {
+			logger(LL_DEBUG, "%s: can't get the device list from usbmuxd (%d)\n", __func__, list_error);
+		}
+		if (devices) {
+			idevice_device_list_free(devices);
+		}
 		return -1;
 	}
 	*device = NULL;
 	idevice_t dev = NULL;
 	idevice_error_t device_error;
 	restored_client_t restore = NULL;
+	restored_error_t restore_error;
+	long long started;
 	int j;
 	for (j = 0; j < num_devices; j++) {
 		if (restore != NULL) {
@@ -188,17 +207,23 @@ static int restore_idevice_new(struct idevicerestore_client_t* client, idevice_t
 			continue;
 		}
 
-		if (restored_client_new(dev, &restore, "idevicerestore") != RESTORE_E_SUCCESS) {
-			logger(LL_DEBUG, "%s: can't connect to restored on device with UDID %s\n", __func__, devices[j]);
+		started = restore_now_ms();
+		restore_error = restored_client_new(dev, &restore, "idevicerestore");
+		if (restore_error != RESTORE_E_SUCCESS) {
+			logger(LL_DEBUG, "%s: can't connect to restored on device with UDID %s (%d)\n", __func__, devices[j], restore_error);
+			restore = NULL;
 			continue;
 
 		}
 		char* type = NULL;
 		uint64_t version = 0;
-		if (restored_query_type(restore, &type, &version) != RESTORE_E_SUCCESS) {
+		restore_error = restored_query_type(restore, &type, &version);
+		if (restore_error != RESTORE_E_SUCCESS) {
+			logger(LL_DEBUG, "%s: device with UDID %s did not answer QueryType (%d) after %lld ms\n", __func__, devices[j], restore_error, restore_now_ms() - started);
 			continue;
 		}
 		if (strcmp(type, "com.apple.mobile.restored") != 0) {
+			logger(LL_DEBUG, "%s: device with UDID %s answers as %s, not restored\n", __func__, devices[j], type);
 			free(type);
 			continue;
 		}
@@ -208,12 +233,18 @@ static int restore_idevice_new(struct idevicerestore_client_t* client, idevice_t
 			plist_t node = NULL;
 			plist_t hwinfo = NULL;
 
-			if (restored_query_value(restore, "HardwareInfo", &hwinfo) != RESTORE_E_SUCCESS) {
+			restore_error = restored_query_value(restore, "HardwareInfo", &hwinfo);
+			if (restore_error != RESTORE_E_SUCCESS) {
+				logger(LL_DEBUG, "%s: device with UDID %s did not answer the HardwareInfo query (%d) after %lld ms\n", __func__, devices[j], restore_error, restore_now_ms() - started);
+				if (hwinfo) {
+					plist_free(hwinfo);
+				}
 				continue;
 			}
 
 			node = plist_dict_get_item(hwinfo, "UniqueChipID");
 			if (!node || plist_get_node_type(node) != PLIST_UINT) {
+				logger(LL_DEBUG, "%s: device with UDID %s has no UniqueChipID in its HardwareInfo\n", __func__, devices[j]);
 				if (hwinfo) {
 					plist_free(hwinfo);
 				}
@@ -227,6 +258,7 @@ static int restore_idevice_new(struct idevicerestore_client_t* client, idevice_t
 			plist_free(hwinfo);
 
 			if (this_ecid != client->ecid) {
+				logger(LL_DEBUG, "%s: device with UDID %s has ECID %016" PRIx64 ", not %016" PRIx64 "\n", __func__, devices[j], this_ecid, client->ecid);
 				continue;
 			}
 		}
@@ -234,9 +266,19 @@ static int restore_idevice_new(struct idevicerestore_client_t* client, idevice_t
 			restored_client_free(restore);
 			restore = NULL;
 		}
-		client->udid = strdup(devices[j]);
+		if (!client->udid || strcmp(client->udid, devices[j]) != 0) {
+			/* not freed: the other thread may still be reading the previous one */
+			client->udid = strdup(devices[j]);
+		}
 		*device = dev;
+		dev = NULL;
 		break;
+	}
+	if (restore != NULL) {
+		restored_client_free(restore);
+	}
+	if (dev != NULL) {
+		idevice_free(dev);
 	}
 	idevice_device_list_free(devices);
 
