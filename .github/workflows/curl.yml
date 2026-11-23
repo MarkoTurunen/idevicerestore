@@ -58,3 +58,4 @@ jobs:
       with:
         name: libcurl_${{ matrix.arch }}-${{ env.dest }}
         path: libcurl-static.tar
+        retention-days: 3

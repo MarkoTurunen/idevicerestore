@@ -87,6 +87,7 @@ jobs:
       with:
         name: idevicerestore-latest_${{env.target_triplet}}
         path: idevicerestore.tar
+        retention-days: 3
   build-macOS:
     runs-on: macOS-latest
     steps:
@@ -192,6 +193,7 @@ jobs:
       with:
         name: idevicerestore-latest_macOS
         path: idevicerestore.tar
+        retention-days: 3
   build-windows:
     runs-on: windows-latest
     defaults:
@@ -311,6 +313,7 @@ jobs:
       with:
         name: idevicerestore-latest_${{ matrix.arch }}-${{ env.dest }}
         path: idevicerestore.tar
+        retention-days: 3
   build-docker:
     runs-on: ubuntu-latest
     steps:
@@ -324,3 +327,4 @@ jobs:
         with:
           name: idevicerestore-latest_docker
           path: idevicerestore-docker.tar
+          retention-days: 3
