@@ -35,6 +35,7 @@
 #include <libimobiledevice/restore.h>
 #include <libimobiledevice/property_list_service.h>
 #include <libimobiledevice-glue/thread.h>
+#include <libimobiledevice-glue/utils.h>
 #ifdef HAVE_REVERSE_PROXY
 #include <libimobiledevice/reverse_proxy.h>
 #else
@@ -1304,6 +1305,353 @@ static size_t _curl_header_callback(char* buffer, size_t size, size_t nitems, vo
 	return len;
 }
 
+/* URLAsset requests: the restore OS asks for the key of the AEA-encrypted filesystem (an fcs-keys URL on
+ * wkms-public.apple.com) right after ASR connects, and gives up on ASR about 10 s later. A slow route to Apple
+ * made the live fetch take longer than that (#88). The key URL is in the AEA header of the image in the IPSW
+ * ("com.apple.wkms.fcs-key-url"), so it is fetched before the restore starts and kept in memory and in
+ * <cache_dir>/url-assets; the response is the same for every device restored with that image. */
+
+#define URL_ASSET_FCS_KEYS_PREFIX "https://wkms-public.apple.com/fcs-keys/"
+#define URL_ASSET_MAX_CACHED 16
+#define URL_ASSET_MAX_AUTH_DATA (1024 * 1024)
+
+struct url_asset_entry {
+	char* url;
+	plist_t response; /* dict with ResponseBody, ResponseBodyDone, ResponseHeaders, ResponseStatus */
+};
+
+static struct url_asset_entry url_asset_cache[URL_ASSET_MAX_CACHED];
+static int url_asset_cache_count = 0;
+static mutex_t url_asset_mutex;
+static thread_once_t url_asset_once = THREAD_ONCE_INIT;
+
+static void _url_asset_init(void)
+{
+	mutex_init(&url_asset_mutex);
+}
+
+static uint64_t _url_asset_now_ms(void)
+{
+	struct timeval tv;
+	gettimeofday(&tv, NULL);
+	return (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+/* Only fcs-keys responses are cached: they are static per key id. Returns the key id (the file name in the
+ * disk cache) or NULL. */
+static const char* _url_asset_cacheable_key_id(const char* url)
+{
+	if (!url || strncmp(url, URL_ASSET_FCS_KEYS_PREFIX, strlen(URL_ASSET_FCS_KEYS_PREFIX)) != 0) {
+		return NULL;
+	}
+	const char* id = url + strlen(URL_ASSET_FCS_KEYS_PREFIX);
+	size_t len = strlen(id);
+	if (len == 0 || len > 200) {
+		return NULL;
+	}
+	for (size_t i = 0; i < len; i++) {
+		char c = id[i];
+		if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '=')) {
+			return NULL;
+		}
+	}
+	return id;
+}
+
+static char* _url_asset_disk_path(struct idevicerestore_client_t* client, const char* key_id)
+{
+	if (!client->cache_dir || !key_id) {
+		return NULL;
+	}
+	char* dir = string_build_path(client->cache_dir, "url-assets", NULL);
+	char* file = string_build_path(dir, key_id, NULL);
+	free(dir);
+	char* path = string_concat(file, ".plist", NULL);
+	free(file);
+	return path;
+}
+
+/* Returns a copy of the cached response for url, from memory or the disk cache, or NULL. */
+static plist_t _url_asset_lookup(struct idevicerestore_client_t* client, const char* url)
+{
+	thread_once(&url_asset_once, _url_asset_init);
+	plist_t found = NULL;
+	mutex_lock(&url_asset_mutex);
+	for (int i = 0; i < url_asset_cache_count; i++) {
+		if (!strcmp(url_asset_cache[i].url, url)) {
+			found = plist_copy(url_asset_cache[i].response);
+			break;
+		}
+	}
+	mutex_unlock(&url_asset_mutex);
+	if (found) {
+		return found;
+	}
+
+	char* path = _url_asset_disk_path(client, _url_asset_cacheable_key_id(url));
+	if (!path) {
+		return NULL;
+	}
+	void* data = NULL;
+	size_t size = 0;
+	struct stat st;
+	/* read_file logs an error for a missing file; a cache miss is normal */
+	if (stat(path, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0 && read_file(path, &data, &size) == 0 && size > 0) {
+		plist_t entry = NULL;
+		plist_from_bin((const char*)data, (uint32_t)size, &entry);
+		const char* cached_url = PLIST_IS_DICT(entry) ? plist_get_string_ptr(plist_dict_get_item(entry, "URL"), NULL) : NULL;
+		plist_t response = PLIST_IS_DICT(entry) ? plist_dict_get_item(entry, "Response") : NULL;
+		if (cached_url && !strcmp(cached_url, url) && PLIST_IS_DICT(response) && PLIST_IS_DATA(plist_dict_get_item(response, "ResponseBody"))) {
+			found = plist_copy(response);
+		} else {
+			logger(LL_WARNING, "Ignoring unreadable URLAsset cache file %s\n", path);
+		}
+		plist_free(entry);
+	}
+	free(data);
+	free(path);
+	return found;
+}
+
+static void _url_asset_store(struct idevicerestore_client_t* client, const char* url, plist_t response, int write_to_disk)
+{
+	const char* key_id = _url_asset_cacheable_key_id(url);
+	if (!key_id) {
+		return;
+	}
+	thread_once(&url_asset_once, _url_asset_init);
+	mutex_lock(&url_asset_mutex);
+	int known = 0;
+	for (int i = 0; i < url_asset_cache_count; i++) {
+		if (!strcmp(url_asset_cache[i].url, url)) {
+			known = 1;
+			break;
+		}
+	}
+	if (!known && url_asset_cache_count < URL_ASSET_MAX_CACHED) {
+		url_asset_cache[url_asset_cache_count].url = strdup(url);
+		url_asset_cache[url_asset_cache_count].response = plist_copy(response);
+		url_asset_cache_count++;
+	}
+	mutex_unlock(&url_asset_mutex);
+
+	char* path = write_to_disk ? _url_asset_disk_path(client, key_id) : NULL;
+	if (!path) {
+		return;
+	}
+	char* dir = string_build_path(client->cache_dir, "url-assets", NULL);
+	mkdir_with_parents(dir, 0755);
+	free(dir);
+	plist_t entry = plist_new_dict();
+	plist_dict_set_item(entry, "URL", plist_new_string(url));
+	plist_dict_set_item(entry, "Response", plist_copy(response));
+	char* bin = NULL;
+	uint32_t bin_size = 0;
+	plist_to_bin(entry, &bin, &bin_size);
+	plist_free(entry);
+	/* Write to a temporary file and rename, so a parallel restore on another port never reads half a file. */
+	char suffix[32];
+	snprintf(suffix, sizeof(suffix), ".%d.tmp", (int)getpid());
+	char* tmp = string_concat(path, suffix, NULL);
+	FILE* out = bin ? fopen(tmp, "wb") : NULL;
+	int written = out && fwrite(bin, 1, bin_size, out) == bin_size;
+	if (out && fclose(out) != 0) {
+		written = 0;
+	}
+	if (written && rename(tmp, path) == 0) {
+		logger(LL_VERBOSE, "Stored URLAsset response in %s\n", path);
+	} else {
+		logger(LL_WARNING, "Could not store URLAsset response in %s\n", path);
+		remove(tmp);
+	}
+	free(tmp);
+	free(bin);
+	free(path);
+}
+
+/* GETs url and returns the response dict the restore OS expects, or NULL when no HTTP response came. */
+static plist_t _url_asset_fetch(struct idevicerestore_client_t* client, const char* url, long* http_status, uint64_t* elapsed_ms)
+{
+	char curl_error_message[CURL_ERROR_SIZE];
+	curl_error_message[0] = '\0';
+	CURL* handle = curl_easy_init();
+	if (!handle) {
+		logger(LL_ERROR, "%s: Unable to initialize curl\n", __func__);
+		return NULL;
+	}
+	/* disable SSL verification to allow download from untrusted https locations */
+	curl_easy_setopt(handle, CURLOPT_SSL_VERIFYPEER, 0);
+
+	query_response response = { 0, malloc(1) };
+	if (!response.content) {
+		curl_easy_cleanup(handle);
+		return NULL;
+	}
+	response.content[0] = '\0';
+
+	plist_t response_headers = plist_new_dict();
+	curl_easy_setopt(handle, CURLOPT_HTTPGET, 1L);
+	curl_easy_setopt(handle, CURLOPT_ERRORBUFFER, curl_error_message);
+	curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, (curl_write_callback)&_curl_write_callback);
+	curl_easy_setopt(handle, CURLOPT_HEADERFUNCTION, &_curl_header_callback);
+	curl_easy_setopt(handle, CURLOPT_HEADERDATA, response_headers);
+	curl_easy_setopt(handle, CURLOPT_WRITEDATA, &response);
+	curl_easy_setopt(handle, CURLOPT_CONNECTTIMEOUT, 15L);
+	curl_easy_setopt(handle, CURLOPT_TIMEOUT, 60L);
+	if (client->debug_level > 0) {
+		curl_easy_setopt(handle, CURLOPT_VERBOSE, 1L);
+	}
+	curl_easy_setopt(handle, CURLOPT_FOLLOWLOCATION, 1);
+	curl_easy_setopt(handle, CURLOPT_URL, url);
+	uint64_t start = _url_asset_now_ms();
+	CURLcode res = curl_easy_perform(handle);
+	*elapsed_ms = _url_asset_now_ms() - start;
+
+	*http_status = 0;
+	curl_easy_getinfo(handle, CURLINFO_RESPONSE_CODE, http_status);
+	curl_easy_cleanup(handle);
+
+	if (res != CURLE_OK && *http_status == 0) {
+		logger(LL_WARNING, "URLAsset request for %s failed after %llu ms: %s\n", url, (unsigned long long)*elapsed_ms,
+			curl_error_message[0] ? curl_error_message : curl_easy_strerror(res));
+		plist_free(response_headers);
+		free(response.content);
+		return NULL;
+	}
+
+	plist_t dict = plist_new_dict();
+	plist_dict_set_item(dict, "ResponseBody", plist_new_data(response.content, response.length));
+	plist_dict_set_item(dict, "ResponseBodyDone", plist_new_bool(1));
+	plist_dict_set_item(dict, "ResponseHeaders", response_headers);
+	plist_dict_set_item(dict, "ResponseStatus", plist_new_uint(*http_status));
+	free(response.content);
+	return dict;
+}
+
+/* Returns the fcs-key URL in the AEA header of path in the IPSW, or NULL when it is no AEA image or has none. */
+static char* _url_asset_aea_key_url(ipsw_archive_t ipsw, const char* path)
+{
+	if (!ipsw_file_exists(ipsw, path)) {
+		return NULL;
+	}
+	ipsw_file_handle_t file = ipsw_file_open(ipsw, path);
+	if (!file) {
+		return NULL;
+	}
+	char* url = NULL;
+	unsigned char header[12];
+	if (ipsw_file_read(file, header, sizeof(header)) == (int64_t)sizeof(header) && memcmp(header, "AEA1", 4) == 0) {
+		uint32_t auth_size = (uint32_t)header[8] | ((uint32_t)header[9] << 8) | ((uint32_t)header[10] << 16) | ((uint32_t)header[11] << 24);
+		unsigned char* auth = (auth_size > 0 && auth_size <= URL_ASSET_MAX_AUTH_DATA) ? malloc(auth_size) : NULL;
+		if (auth && ipsw_file_read(file, auth, auth_size) == (int64_t)auth_size) {
+			/* auth data: fields of a 32-bit little endian size (including itself), the key, NUL and the value */
+			static const char key[] = "com.apple.wkms.fcs-key-url";
+			uint32_t pos = 0;
+			while (pos + 4 <= auth_size && !url) {
+				uint32_t field = (uint32_t)auth[pos] | ((uint32_t)auth[pos + 1] << 8) | ((uint32_t)auth[pos + 2] << 16) | ((uint32_t)auth[pos + 3] << 24);
+				if (field < 4 || field > auth_size - pos) {
+					break;
+				}
+				const char* kv = (const char*)auth + pos + 4;
+				uint32_t kv_size = field - 4;
+				if (kv_size > sizeof(key) && memcmp(kv, key, sizeof(key)) == 0) { /* sizeof(key) includes the NUL */
+					uint32_t value_size = kv_size - (uint32_t)sizeof(key);
+					while (value_size > 0 && kv[sizeof(key) + value_size - 1] == '\0') {
+						value_size--;
+					}
+					if (value_size > 8 && value_size < 1024 && strncmp(kv + sizeof(key), "https://", 8) == 0) {
+						url = strndup(kv + sizeof(key), value_size);
+					}
+				}
+				pos += field;
+			}
+		}
+		free(auth);
+	}
+	ipsw_file_close(file);
+	return url;
+}
+
+int restore_prefetch_url_assets(struct idevicerestore_client_t* client)
+{
+	if (!client || !client->ipsw) {
+		return 0;
+	}
+	plist_t manifest = NULL;
+	int tss_enabled = 0;
+	if (ipsw_extract_build_manifest(client->ipsw, &manifest, &tss_enabled) < 0 || !PLIST_IS_DICT(manifest)) {
+		plist_free(manifest);
+		return 0;
+	}
+
+	/* The AEA images of all build identities (the restore OS picks one; they usually share one key). */
+	plist_t paths = plist_new_dict();
+	plist_t identities = plist_dict_get_item(manifest, "BuildIdentities");
+	uint32_t identity_count = PLIST_IS_ARRAY(identities) ? plist_array_get_size(identities) : 0;
+	for (uint32_t i = 0; i < identity_count; i++) {
+		plist_t components = plist_dict_get_item(plist_array_get_item(identities, i), "Manifest");
+		plist_dict_iter iter = NULL;
+		if (!PLIST_IS_DICT(components)) {
+			continue;
+		}
+		plist_dict_new_iter(components, &iter);
+		plist_t component = NULL;
+		do {
+			char* name = NULL;
+			component = NULL;
+			plist_dict_next_item(components, iter, &name, &component);
+			free(name);
+			const char* path = component ? plist_get_string_ptr(plist_access_path(component, 2, "Info", "Path"), NULL) : NULL;
+			size_t len = path ? strlen(path) : 0;
+			if (len > 4 && !strcmp(path + len - 4, ".aea")) {
+				plist_dict_set_item(paths, path, plist_new_bool(1));
+			}
+		} while (component);
+		free(iter);
+	}
+	plist_free(manifest);
+
+	int fetched = 0;
+	plist_t urls = plist_new_dict();
+	plist_dict_iter iter = NULL;
+	plist_dict_new_iter(paths, &iter);
+	char* path = NULL;
+	do {
+		path = NULL;
+		plist_dict_next_item(paths, iter, &path, NULL);
+		if (!path) {
+			break;
+		}
+		char* url = _url_asset_aea_key_url(client->ipsw, path);
+		if (url && !plist_dict_get_item(urls, url)) {
+			plist_dict_set_item(urls, url, plist_new_bool(1));
+			plist_t cached = _url_asset_lookup(client, url);
+			if (cached) {
+				logger(LL_INFO, "URLAsset prefetch: filesystem key of %s is cached\n", path);
+				/* keep it in memory too, so the restore does not read the disk cache again */
+				_url_asset_store(client, url, cached, 0);
+				plist_free(cached);
+			} else if (_url_asset_cacheable_key_id(url)) {
+				long status = 0;
+				uint64_t elapsed = 0;
+				plist_t response = _url_asset_fetch(client, url, &status, &elapsed);
+				logger(LL_INFO, "URLAsset prefetch: filesystem key of %s fetched in %llu ms (HTTP %ld)\n", path, (unsigned long long)elapsed, status);
+				if (response && status == 200) {
+					_url_asset_store(client, url, response, 1);
+					fetched++;
+				}
+				plist_free(response);
+			}
+		}
+		free(url);
+		free(path);
+	} while (1);
+	free(iter);
+	plist_free(urls);
+	plist_free(paths);
+	return fetched;
+}
+
 int restore_send_url_asset(struct idevicerestore_client_t* client, plist_t message)
 {
 	plist_t arguments = plist_dict_get_item(message, "Arguments");
@@ -1327,58 +1675,38 @@ int restore_send_url_asset(struct idevicerestore_client_t* client, plist_t messa
 		logger(LL_ERROR, "%s: Unable to extract RequestURL from Arguments\n", __func__);
 		return -1;
 	}
-	logger(LL_INFO, "Requesting URLAsset from %s\n", request_url);
 
-	char curl_error_message[CURL_ERROR_SIZE];
-	CURL* handle = curl_easy_init();
-	/* disable SSL verification to allow download from untrusted https locations */
-	curl_easy_setopt(handle, CURLOPT_SSL_VERIFYPEER, 0);
-
-	query_response* response = malloc(sizeof(query_response));
-	if (response == NULL) {
-		logger(LL_ERROR, "%s: Unable to allocate sufficient memory\n", __func__);
-		return -1;
+	plist_t dict = _url_asset_lookup(client, request_url);
+	if (dict) {
+		logger(LL_INFO, "Sending cached URLAsset for %s\n", request_url);
+	} else {
+		logger(LL_INFO, "Requesting URLAsset from %s\n", request_url);
+		long http_response = 0;
+		uint64_t elapsed = 0;
+		dict = _url_asset_fetch(client, request_url, &http_response, &elapsed);
+		logger(LL_INFO, "URLAsset response after %llu ms (HTTP %ld)\n", (unsigned long long)elapsed, http_response);
+		if (!dict) {
+			/* answer anyway, as before, so the restore OS does not wait for a response that never comes */
+			dict = plist_new_dict();
+			plist_dict_set_item(dict, "ResponseBody", plist_new_data("", 0));
+			plist_dict_set_item(dict, "ResponseBodyDone", plist_new_bool(1));
+			plist_dict_set_item(dict, "ResponseHeaders", plist_new_dict());
+			plist_dict_set_item(dict, "ResponseStatus", plist_new_uint(0));
+		} else if (http_response == 200) {
+			_url_asset_store(client, request_url, dict, 1);
+		}
 	}
-
-	response->length = 0;
-	response->content = malloc(1);
-	response->content[0] = '\0';
-
-	curl_easy_setopt(handle, CURLOPT_HTTPGET, 1L);
-	curl_easy_setopt(handle, CURLOPT_ERRORBUFFER, curl_error_message);
-	curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, (curl_write_callback)&_curl_write_callback);
-	curl_easy_setopt(handle, CURLOPT_HEADERFUNCTION, &_curl_header_callback);
-	plist_t response_headers = plist_new_dict();
-	curl_easy_setopt(handle, CURLOPT_HEADERDATA, response_headers);
-	curl_easy_setopt(handle, CURLOPT_WRITEDATA, response);
-	if (client->debug_level > 0) {
-		curl_easy_setopt(handle, CURLOPT_VERBOSE, 1L);
-	}
-	curl_easy_setopt(handle, CURLOPT_FOLLOWLOCATION, 1);
-	curl_easy_setopt(handle, CURLOPT_URL, request_url);
-	curl_easy_perform(handle);
-
-	long http_response = 0;
-	curl_easy_getinfo(handle, CURLINFO_RESPONSE_CODE, &http_response);
-
-	curl_easy_cleanup(handle);
-
-	plist_t dict = plist_new_dict();
-	plist_dict_set_item(dict, "ResponseBody", plist_new_data(response->content, response->length));
-	plist_dict_set_item(dict, "ResponseBodyDone", plist_new_bool(1));
-	plist_dict_set_item(dict, "ResponseHeaders", response_headers);
-	plist_dict_set_item(dict, "ResponseStatus", plist_new_uint(http_response));
-
-	free(response);
 
 	restore_service_client_t service = _restore_get_service_client_for_data_request(client, message);
 	if (!service) {
 		logger(LL_ERROR, "%s: Unable to connect to service client\n", __func__);
+		plist_free(dict);
 		return -1;
 	}
 
 	_restore_service_send(service, dict, PLIST_FORMAT_BINARY);
 	_restore_service_free(service);
+	plist_free(dict);
 
 	return 0;
 }

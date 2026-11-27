@@ -59,6 +59,7 @@ int restore_send_component(struct idevicerestore_client_t* client, plist_t messa
 int restore_device(struct idevicerestore_client_t* client, plist_t build_identity);
 int restore_open_with_timeout(struct idevicerestore_client_t* client);
 int restore_send_filesystem(struct idevicerestore_client_t* client, plist_t message);
+int restore_prefetch_url_assets(struct idevicerestore_client_t* client);
 int restore_send_fdr_trust_data(struct idevicerestore_client_t* client, plist_t message);
 
 #ifdef __cplusplus

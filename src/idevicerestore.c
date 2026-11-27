@@ -745,6 +745,11 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 	}
 	idevicerestore_progress(client, RESTORE_STEP_DETECT, 0.6);
 
+	// Fetch the filesystem keys of the AEA images before the device needs them: the restore OS gives up on
+	// ASR about 10 s after it asks, and the first request to Apple can take longer (#88). Also done with -n,
+	// so a firmware prefetch leaves the keys in the cache.
+	restore_prefetch_url_assets(client);
+
 	if (client->flags & FLAG_NOACTION) {
 		return 0;
 	}
